@@ -35,6 +35,7 @@
 #include "core/emulator_settings.h"
 #include "core/signals.h"
 #include "sdl_window.h"
+#include "video_core/cache_storage.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -324,6 +325,8 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
                 SDL_Delay(50);
             }
         }
+        // sotc: write the pipelines still queued for the cache before leaving.
+        Storage::DataBase::Instance().Close();
         std::fflush(stdout);
         std::_Exit(0);
     });
