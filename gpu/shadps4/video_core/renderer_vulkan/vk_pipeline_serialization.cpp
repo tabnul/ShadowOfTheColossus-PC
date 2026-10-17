@@ -241,6 +241,10 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     infos.fill(nullptr);
     modules.fill(nullptr);
 
+    if (!it.value()->Handle()) {
+        compute_pipelines.erase(compute_key);
+        return false;
+    }
     return true;
 }
 
@@ -325,6 +329,10 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     modules.fill(nullptr);
     fetch_shader = nullptr;
 
+    if (!it.value()->Handle()) {
+        graphics_pipelines.erase(graphics_key);
+        return false;
+    }
     return true;
 }
 
