@@ -832,9 +832,9 @@ void Rasterizer::FlushPeriodic() {
     // scenes, canyon bridge +2% (count based: 64 helped the first and hurt the second).
     static const u64 flush_us = [] {
         if (const char* v = std::getenv("SOTC_FLUSH_US")) {
-            return std::strtoull(v, nullptr, 10);
+            return static_cast<u64>(std::strtoull(v, nullptr, 10));
         }
-        return std::getenv("SOTC_FLUSH_EVERY") ? u64{0} : u64{500};
+        return std::getenv("SOTC_FLUSH_EVERY") ? u64(0) : u64(500);
     }();
     const u64 tick = scheduler.CurrentTick();
     if (tick != commands_tick) {
