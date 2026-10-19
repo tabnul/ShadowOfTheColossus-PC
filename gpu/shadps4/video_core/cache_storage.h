@@ -10,6 +10,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -28,7 +29,7 @@ public:
         return *Common::Singleton<DataBase>::Instance();
     }
 
-    void Open();
+    void Open(std::string_view cache_variant);
     void Close();
     void Clear();
     [[nodiscard]] bool IsOpened() const {
