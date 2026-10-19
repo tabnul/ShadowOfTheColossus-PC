@@ -27,7 +27,19 @@ if (BB_LTO)
         message(WARNING "LTO unavailable: ${bb_ipo_error}")
     endif()
 endif()
-if (BB_PGO STREQUAL "generate")
+if (BB_PGO STREQUAL "generate" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # sotc: Clang (Windows/MSYS2) instrumentation. Raw profiles go to BB_PGO_DIR/default_<id>.profraw
+    # (%m: every dump of every run merges into the same file); `llvm-profdata merge -o
+    # BB_PGO_DIR/bbgpu.profdata BB_PGO_DIR/*.profraw` makes the profile BB_PGO=use reads.
+    add_compile_options(-fprofile-generate=${BB_PGO_DIR} -fprofile-update=atomic)
+    add_link_options(-fprofile-generate=${BB_PGO_DIR})
+    add_compile_definitions(BB_PGO_GENERATE BB_PGO_CLANG)
+elseif (BB_PGO STREQUAL "use" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Functions changed since the profile was taken are compiled without it (no error).
+    add_compile_options(-fprofile-use=${BB_PGO_DIR}/bbgpu.profdata -Wno-profile-instr-unprofiled
+                        -Wno-profile-instr-out-of-date -Wno-profile-instr-missing
+                        -Wno-backend-plugin)
+elseif (BB_PGO STREQUAL "generate")
     # Atomic counters: the GPU, recording, preparation and copy threads run the same code.
     add_compile_options(-fprofile-generate=${BB_PGO_DIR} -fprofile-update=atomic)
     add_link_options(-fprofile-generate=${BB_PGO_DIR})
@@ -83,10 +95,25 @@ find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
 set(SIRIT_USE_SYSTEM_SPIRV_HEADERS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
 
-# bbport: FSR 3.1 temporal upscaling / frame generation, native Vulkan (MIT, FireBurn/FSR-Vulkan).
-set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
+# sotc: frame generation backend (third_party/fsr-vulkan, MIT): only the FSR 3.1.6 frame
+# interpolation + optical flow library and the presenter policy are built and linked, statically.
+# The 3.1.6 target lives inside the SDK 2.3 scaffold block, so that option stays on; the 1.1.4
+# host/backend, FSR4, probe, tests and install rules are off. Nothing calls it unless SOTC_FG=1.
+foreach(opt FFX_VK_PORTABLE_BUILD_TESTS FFX_VK_PORTABLE_BUILD_PROBE FFX_VK_PORTABLE_BUILD_FSR3_HOST
+            FFX_VK_PORTABLE_BUILD_FSR3_VK_BACKEND FFX_VK_PORTABLE_BUILD_FSR4_V07_VULKAN
+            FFX_VK_PORTABLE_INSTALL)
+    set(${opt} OFF CACHE BOOL "" FORCE)
+endforeach()
+set(FFX_VK_PORTABLE_BUILD_FSR3_3_1_5_SCAFFOLD ON CACHE BOOL "" FORCE)
 add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
+# sotc: constant buffers are recycled instead of allocated per dispatch, and the 3.1.6 wrapper
+# drives the bridge's per-frame retire (see both file headers).
+get_target_property(bb_fg_sources ffx_vulkan_fsr3_vk_framegeneration_3_1_6 SOURCES)
+list(TRANSFORM bb_fg_sources REPLACE "^src/ffx_vk_fsr3_3_1_5_bridge\\.cpp$"
+     "${CMAKE_CURRENT_SOURCE_DIR}/sotc/fsr/ffx_vk_fsr3_3_1_5_bridge.cpp")
+list(TRANSFORM bb_fg_sources REPLACE "^src/ffx_vk_fsr3_3_1_6_framegen\\.cpp$"
+     "${CMAKE_CURRENT_SOURCE_DIR}/sotc/fsr/ffx_vk_fsr3_3_1_6_framegen.cpp")
+set_property(TARGET ffx_vulkan_fsr3_vk_framegeneration_3_1_6 PROPERTY SOURCES ${bb_fg_sources})
 
 # Host shaders -> headers (same scheme as shadPS4's host_shaders/CMakeLists.txt).
 set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/host_shaders)
@@ -144,8 +171,8 @@ add_library(bbgpu ${BBGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOU
     shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
     shadps4/core/libraries/videodec/video_utils.cpp)
 add_dependencies(bbgpu host_shaders)
-# In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
-# embedded Cyrillic font (third_party/fonts).
+# Overlay for the game's dialogs (save list, text entry) and the FPS counter: Dear ImGui
+# (third_party/imgui, MIT) with its Vulkan backend, and an embedded font (third_party/fonts).
 target_sources(bbgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
     third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
     third_party/imgui/backends/imgui_impl_vulkan.cpp)
@@ -164,6 +191,9 @@ if (NOT WIN32)
 endif()
 target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
     tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+# sotc: frame generation (SOTC_FG), see the fsr-vulkan block above.
+target_link_libraries(bbgpu PRIVATE ffx-vulkan::fsr3-vk-framegeneration-3.1.6
+    ffx-vulkan::framegeneration-presenter-policy)
 if (WIN32)
     # Guest code is entered with the System V ABI; NOMINMAX/WIN32_LEAN_AND_MEAN keep
     # <windows.h> out of the way of std::min/max and the Vulkan/SDL headers.
@@ -195,10 +225,6 @@ if (WIN32)
     target_link_options(bb-probe PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
     add_executable(bb-gpu-capabilities ../tools/gpu_capabilities.c ../packaging/windows/bb-gpu-capabilities.rc)
     target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan)
-    # "Play Bloodborne.exe": the game with the launcher's saved settings, no launcher window.
-    add_executable(bb-play WIN32 ../packaging/windows/play.c ../packaging/windows/play.rc)
-    target_compile_options(bb-play PRIVATE -municode)
-    target_link_options(bb-play PRIVATE -municode)
 endif()
 
 # Explicit test targets; neither launches the game nor needs a Vulkan device.
@@ -234,9 +260,17 @@ target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(camera-motion-test PRIVATE bbgpu)
 add_dependencies(camera-motion-test host_shaders)
 
-# bbport: FSR 4 benchmark outside the game (tools/fsr4_bench.cpp): ninja -C out/gpu fsr4-bench.
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
     shim/bbport_settings.cpp)
 target_include_directories(upscaler-support-test PRIVATE shim)
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
 
+# sotc: display refresh estimate and guest vblank lock of the SOTC_FG frame pacer.
+add_executable(frame-pacer-test EXCLUDE_FROM_ALL ../tests/test_frame_pacer.cpp)
+target_include_directories(frame-pacer-test PRIVATE shadps4)
+target_compile_options(frame-pacer-test PRIVATE -UNDEBUG)
+
+# sotc: GPU cost of the FSR 3.1.6 frame generation step at 1080p/1440p/2160p output (needs a
+# Vulkan device with VK_KHR_compute_shader_derivatives; does not start the game).
+add_executable(fg-bench EXCLUDE_FROM_ALL ../tools/fg_bench.cpp)
+target_link_libraries(fg-bench PRIVATE ffx-vulkan::fsr3-vk-framegeneration-3.1.6)

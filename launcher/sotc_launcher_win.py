@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Shadow of the Colossus launcher for Windows (Tkinter), modelled on bbport_launcher_win.py.
+"""Shadow of the Colossus launcher for Windows (Tkinter), derived from the bbport launcher.
 
 One window for the port's settings: the game dump, the user's own sound modules, saves, modes
 (16x AF, 60 FPS), display and diagnostics. They go to sotc.py as environment variables.
@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 
 FROZEN = getattr(sys, 'frozen', False)
 PORT_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent.parent
@@ -28,7 +29,7 @@ CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'sotc-launcher'
 CONFIG_FILE = CONFIG_DIR / 'settings.json'
 GAME_ID, GAME_VERSION = 'CUSA08809', '01.01'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.57'
+VERSION = '0.67-cp-mt'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -51,6 +52,32 @@ def attach_stdio():
             except OSError:
                 stream = None
         setattr(sys, name, stream or open(os.devnull, 'w'))
+    # An inherited handle can exist and still refuse writes ("[Errno 22] Invalid argument" from a
+    # print in link_modules.py, issue #104 upstream): this output is informational, so a failed
+    # write drops the stream instead of aborting the preparation.
+    for name in ('stdout', 'stderr'):
+        setattr(sys, name, _TolerantStream(getattr(sys, name)))
+
+
+class _TolerantStream:
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        try:
+            return self._stream.write(text)
+        except (OSError, ValueError):
+            self._stream = open(os.devnull, 'w')
+            return len(text)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except (OSError, ValueError):
+            pass
+
+    def __getattr__(self, attr):
+        return getattr(self._stream, attr)
 
 
 def run_role(argv):
@@ -105,7 +132,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
-                'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
+                'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True, 'perf_sun_shadows': True, 'frame_gen': False,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': ''}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
@@ -248,6 +275,43 @@ def user_dir(s):
     return folder
 
 
+LOGS_KEPT = 5      # last_run.log and last_run.1.log ... last_run.4.log
+CRASH_LOGS_KEPT = 20
+
+
+def open_session_log(log_dir):
+    """Opens a fresh user/last_run.log; the previous sessions' logs move to last_run.1.log (the
+    one before) ... last_run.4.log, so a crash is not lost when the game is started again."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(LOGS_KEPT - 1, 0, -1):
+        older = log_dir / ('last_run.log' if i == 1 else f'last_run.{i - 1}.log')
+        if older.is_file():
+            try:
+                os.replace(older, log_dir / f'last_run.{i}.log')
+            except OSError:
+                pass
+    return open(log_dir / 'last_run.log', 'w', encoding='utf-8', buffering=1)
+
+
+def keep_crash_log(log_dir, code):
+    """After a session that ended with an error code, copies its log to
+    user/crashes/<date>_<time>_<code>.log (the last 20 are kept)."""
+    if code == 0:
+        return
+    crashes = log_dir / 'crashes'
+    try:
+        crashes.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime('%Y-%m-%d_%H-%M-%S')
+        shutil.copy2(log_dir / 'last_run.log', crashes / f'{stamp}_{code & 0xffffffff:#x}.log')
+        for old in sorted(crashes.glob('*.log'))[:-CRASH_LOGS_KEPT]:
+            old.unlink()
+        # Minidumps written by bb-probe on a fatal fault (src/probe.c): the last 5.
+        for old in sorted(crashes.glob('*.dmp'))[:-5]:
+            old.unlink()
+    except OSError:
+        pass
+
+
 def short_path(path):
     """A path for display: relative to the port folder when inside it, else as is."""
     try:
@@ -271,6 +335,8 @@ def game_environment(s):
         env['BB_LANGUAGE'] = s['language']
     if str(s['player_name']).strip():
         env['BB_USER_NAME'] = str(s['player_name']).strip()
+    # On-screen counter (bbport_overlay.cpp; beside the game's own FPS with frame generation).
+    env['BB_SHOW_FPS'] = '1' if s['show_fps'] else '0'
     if s['show_fps']:
         env['SOTC_FPS'] = '1'
     if s['readbacks']:
@@ -280,6 +346,9 @@ def game_environment(s):
         # From Pink-shadPS4: no GPU index-buffer culling (always both), same image, far fewer
         # GPU results the CPU has to wait for.
         cvars += ['doIndexBufferCulling=0', 'doSunShadowIndexBufferCulling=0']
+    if not s.get('perf_sun_shadows', True):
+        # Skips the cascaded sun shadow maps: ~1000 fewer draws per frame, Shrine 48 -> 50.7 FPS.
+        cvars.append('r_enableCascadeShadows=0')
     cvars += str(s.get('engine_cvars', '')).split()
     env['SOTC_CVARS'] = ' '.join(cvars)
     env['SOTC_RECORD_THREAD'] = '1' if s.get('perf_record_thread', True) else '0'
@@ -287,9 +356,12 @@ def game_environment(s):
         env['BB_DIRECT_MEMORY_ACCESS'] = '0'
     # Periodic submits and readbacks ahead: by default only with NVIDIA (vk_rasterizer.cpp).
     if s.get('gpu_submit') == 'on':
-        env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '500', '1'
+        env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '1000', '1'
     elif s.get('gpu_submit') == 'off':
         env['SOTC_FLUSH_EVERY'], env['SOTC_RB_AHEAD'] = '0', '0'
+    if s.get('frame_gen'):
+        # FSR 3.1.6 frame interpolation on its own present thread (vk_frame_pacer.cpp); forces FIFO.
+        env['SOTC_FG'] = '1'
     env['SOTC_NEO'] = '1' if s.get('neo') else '0'
     env['SOTC_OUTPUT_RES'] = s.get('output_res') or '1920x1080'
     env['BB_FSR1'] = '1' if s.get('upscaler', 'fsr1') == 'fsr1' else '0'
@@ -341,6 +413,7 @@ class Launcher:
         self.app = {**APP_DEFAULTS, **load_json(CONFIG_FILE, {})}
         self.vars = {}
         self.process = self.job = None
+        self.stopping = False
         self.output = queue.Queue()
         self.ui_calls = queue.Queue()
         self.gpu_text = _('• Verificando a placa de vídeo…', '• Checking the graphics card…')
@@ -773,6 +846,16 @@ class Launcher:
         self.row(f, _('Upscaler', 'Upscaler'), self.choice(f, 'upscaler', UPSCALERS),
                  _('FSR 1 amplia com bordas nítidas (acima de 1080p).', 'FSR 1 upscales with sharp edges (above 1080p).'))
         self.row(f, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(f, 'sharpness', SHARPNESS))
+        self.check(f, 'frame_gen', _('Geração de quadros FSR 3 (experimental)', 'FSR 3 frame generation (experimental)'),
+                   _('Cria um quadro intermediário entre cada par de quadros do jogo: no modo 30 FPS a tela mostra 60. '
+                     'Custa ~1 ms de GPU por quadro gerado e não tira FPS do jogo. Melhor com "60 FPS" desligado. '
+                     'Usa VSync (FIFO) e ignora a opção Apresentação. Ainda sem os vetores de movimento do jogo: '
+                     'bordas de objetos rápidos, HUD e legendas podem tremer. Monitores de 120 Hz ou com G-Sync/FreeSync '
+                     'ficam mais lisos.',
+                     'Creates an in-between frame for each pair of game frames: in 30 FPS mode the screen shows 60. '
+                     'Costs ~1 ms of GPU per generated frame and takes no FPS from the game. Best with "60 FPS" off. '
+                     'Uses VSync (FIFO) and ignores the Presentation option. No game motion vectors yet: edges of '
+                     'fast objects, the HUD and subtitles may shimmer. 120 Hz or G-Sync/FreeSync monitors look smoother.'))
         self.section(f, _('Modo PS4 Pro', 'PS4 Pro mode'))
         self.check(f, 'neo', _('Apresentar-se como PS4 Pro', 'Present as a PS4 Pro'),
                    _('O jogo passa a oferecer, no menu Opções > Apresentação, o Modo Grafismo do PS4 Pro: '
@@ -800,6 +883,11 @@ class Launcher:
                      'Lets shaders read tables straight from game memory (as Pink-shadPS4 does): the lake ripples '
                      'and reflects far away. Off gains ~10% FPS, but distant water is flatter. After a change '
                      'the shaders are compiled again the first time.'))
+        self.check(f, 'perf_sun_shadows', _('Sombras do sol', 'Sun shadows'),
+                   _('Desligadas, o jogo não desenha as sombras do sol (colossos, Wander, cenário, vegetação): '
+                     'a cena fica mais clara e lisa, com ~6% a mais de FPS no santuário (48 → 51).',
+                     'Off, the game skips the sun shadows (colossi, Wander, scenery, vegetation): the scene '
+                     'looks brighter and flatter, ~6% more FPS at the shrine (48 → 51).'))
         self.row(f, _('Envio de trabalho à GPU', 'GPU work submission'), self.choice(f, 'gpu_submit', GPU_SUBMIT),
                  _('Manda trabalho à GPU a cada 0,5 ms e lê resultados por um atalho (técnicas do Pink-shadPS4). '
                    'Medido em NVIDIA (+10–15%); em AMD/Intel use "Ligado" para testar e volte para "Automático" '
@@ -916,7 +1004,8 @@ class Launcher:
         ttk.Button(holder, text=_('Pasta do port', 'Port folder'), command=lambda: self.open_path(PORT_DIR)).pack(side='left', padx=6)
         ttk.Button(holder, text=_('Limpar cache de shaders', 'Clear shader cache'), command=self.clear_cache).pack(side='left')
         self.section(f, _('Diagnóstico', 'Diagnostics'))
-        self.check(f, 'show_fps', _('FPS no registro (a cada 5 s)', 'FPS in the log (every 5 s)'))
+        self.check(f, 'show_fps', _('Contador de FPS na tela (e no registro a cada 5 s)',
+                                    'On-screen FPS counter (and in the log every 5 s)'))
         self.row(f, _('Leituras da GPU', 'GPU readbacks'), self.choice(f, 'readbacks', READBACKS))
         self.row(f, _('Cvars do motor', 'Engine cvars'), ttk.Entry(f, textvariable=self.var('engine_cvars'), width=58),
                  _('Avançado: NOME=valor separados por espaço, acrescentados à linha de comando do jogo.',
@@ -1036,16 +1125,24 @@ class Launcher:
         if source.name != GAME_ID and (source / GAME_ID).is_dir():
             source = source / GAME_ID
         target = user_dir({'user_dir': self.var('user_dir').get()}) / 'savedata' / '1' / GAME_ID
-        if target.exists() and any(target.iterdir()):
-            if not self.messagebox.askyesno('Shadow of the Colossus', _(
-                    'Já há saves em {}. Substituir? (uma cópia fica em {}.bak)',
-                    'There are saves in {} already. Replace them? (a copy stays in {}.bak)').format(target, target.name)):
-                return
-            backup = target.with_name(target.name + '.bak')
-            shutil.rmtree(backup, ignore_errors=True)
-            target.rename(backup)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source, target)
+        # sotc: one save folder picked (it holds sce_sys/param.sfo): import it as one save. The
+        # runtime creates the port's metadata for saves that come without it.
+        single = (source / 'sce_sys' / 'param.sfo').is_file()
+        try:
+            if not single and target.exists() and any(target.iterdir()):
+                if not self.messagebox.askyesno('Shadow of the Colossus', _(
+                        'Já há saves em {}. Substituir? (uma cópia fica em {}.bak)',
+                        'There are saves in {} already. Replace them? (a copy stays in {}.bak)').format(target, target.name)):
+                    return
+                backup = target.with_name(target.name + '.bak')
+                shutil.rmtree(backup, ignore_errors=True)
+                target.rename(backup)
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source, target / source.name if single else target, dirs_exist_ok=True)
+        except OSError as error:
+            self.messagebox.showerror('Shadow of the Colossus', _('Não foi possível importar o save: {}',
+                                                                 'Could not import the save: {}').format(error))
+            return
         self.refresh_status()
         self.messagebox.showinfo('Shadow of the Colossus', _('Save importado para {}.', 'Save imported to {}.').format(target))
 
@@ -1412,10 +1509,9 @@ class Launcher:
 
     def read_output(self, process):
         # The output also goes to user/last_run.log, so a crash can be looked at afterwards.
+        log_dir = user_dir(self.app)
         try:
-            log_dir = user_dir(self.app)
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log = open(log_dir / 'last_run.log', 'w', encoding='utf-8', buffering=1)
+            log = open_session_log(log_dir)
         except OSError:
             log = None
         for raw in iter(process.stdout.readline, b''):
@@ -1433,6 +1529,9 @@ class Launcher:
                 log.close()
             except (OSError, ValueError):
                 pass
+            if not self.stopping:
+                keep_crash_log(log_dir, code)
+        self.stopping = False
         self.output.put((code,))
 
     def drain_output(self):
@@ -1458,6 +1557,7 @@ class Launcher:
 
     def stop(self):
         if self.job:
+            self.stopping = True  # stopped from the launcher: not a crash
             self.job.terminate()
 
     def append(self, text):
@@ -1552,7 +1652,7 @@ def play_without_window(settings):
         write_key_bindings(settings.get('keys'))
     except OSError:
         pass
-    with open(log_dir / 'last_run.log', 'w', encoding='utf-8', buffering=1) as log:
+    with open_session_log(log_dir) as log:
         process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=game_environment(settings),
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
@@ -1563,7 +1663,10 @@ def play_without_window(settings):
                 sys.stdout.write(text)
             except (OSError, ValueError):
                 pass
-        return process.wait()
+        code = process.wait()
+        log.write(f'[exit code {code} = {code & 0xffffffff:#x}]\n')
+    keep_crash_log(log_dir, code)
+    return code
 
 
 def main():

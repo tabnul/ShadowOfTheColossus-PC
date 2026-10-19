@@ -1,5 +1,186 @@
 # Changelog
 
+## 0.68-cp-mt — em preparação
+- **Contador de FPS na tela.** A opção de FPS do lançador (Diagnóstico) agora também mostra o
+  contador no canto da tela (`BB_SHOW_FPS=1`). Com a geração de quadros ligada ele mostra o ritmo
+  do próprio jogo ao lado do total, ex.: **"60 FPS (jogo 30)  33.3 ms"**: o total é o que vai para
+  a tela, o "jogo" é o que a resolução e as opções gráficas mudam. Sem custo medido (Santuário
+  50,3 → 50,1 FPS, dentro do ruído). Ideia do contador do bloodborne_pc de Supermedo.
+
+## 0.67-cp-mt — 2026-10-19
+- **+4,6% de FPS: o "BPE heap guard" deixa de ser montado a cada quadro.** O guard protege os
+  metadados do alocador do jogo quando um readback escreve no heap, e para isso percorria a árvore
+  inteira de blocos livres, ~1 vez por quadro (~6% da thread de desenho). As máscaras de culling
+  lidas de volta caem todas no último 1 MiB do heap, depois do bloco que fecha a cadeia, onde não há
+  metadados: agora o guard acha esse limite uma vez e as escritas acima dele só conferem que ele
+  continua lá. Santuário (mesmo exe, chave desligada/ligada): 47,5 / 47,5 → **49,5 / 49,7 FPS**.
+  Verificado contra o guard completo nos saves (normal e PS4 Pro): ~395 mil escritas, nenhuma sobre
+  metadados. `SOTC_HEAP_FAST=0` volta ao antigo; `SOTC_HEAP_FAST=2` confere cada escrita (log).
+- **Tela cheia num múltiplo de 60 Hz** (correção de [Anthonypc23](https://github.com/Anthonypc23)):
+  quando o monitor não está num múltiplo de 60 Hz (74, 144, 165 Hz...), a tela cheia passa para o
+  modo exclusivo na maior taxa múltipla de 60 que o monitor oferece (ex.: 144 → 120 Hz), e os
+  quadros de 30/60 FPS ficam o mesmo tempo na tela. `BB_FULLSCREEN_HZ=<Hz>` escolhe a taxa;
+  `BB_FULLSCREEN_HZ=0` mantém a do desktop.
+
+## 0.66-cp-mt — 2026-10-18
+- **Geração de quadros FSR 3 (experimental):** nova opção no lançador (Gráficos > Resolução,
+  "Geração de quadros FSR 3"; ou `SOTC_FG=1`). Cria um quadro intermediário entre cada par de
+  quadros do jogo com a interpolação FSR 3.1.6 (fsr-vulkan, MIT): no modo 30 FPS a tela passa a
+  mostrar **60 quadros por segundo**. Os quadros vão para a tela por uma thread própria
+  (`shadPS4:FramePacer`), fora da thread de desenho. Santuário (RTX 5060 Ti): o jogo continua em
+  30,0 FPS, 30 quadros gerados por segundo, ~1,1 ms de GPU cada; com "60 FPS" ligado o jogo fica
+  igual (46,5 → 46,3) e ~35 quadros por segundo são gerados. Força VSync (FIFO). Ainda sem os
+  vetores de movimento do jogo: bordas de objetos rápidos, HUD e legendas podem tremer. Precisa
+  de Vulkan com `VK_KHR_present_wait` e `VK_KHR_compute_shader_derivatives` (NVIDIA RTX recente,
+  AMD RDNA); sem eles o jogo roda como antes. `SOTC_FG_DEBUG=gen` mostra só os quadros gerados.
+  Detalhes em `docs/sotc/FRAMEGEN.md`; licenças em `licenses/`.
+
+## 0.65-cp-mt — 2026-10-18
+- **+4% de FPS: janela de readback menor** (`SOTC_RB_NARROW`, padrão 64 KiB). Quando o jogo lê um
+  dado que a GPU escreveu, o motor baixava e desprotegia 512 KiB em volta; depois a GPU protegia
+  tudo de novo, página por página, a cada quadro. Agora só 64 KiB. Santuário (mesmo exe, chave
+  desligada/ligada): 46,4 / 46,4 → **48,1 / 48,8 FPS**. `SOTC_RB_NARROW=0` volta ao antigo.
+- Lançador: nova opção **"Sombras do sol"** (Gráficos > Desempenho, ligada por padrão). Desligada, o
+  jogo não desenha as sombras do sol (cvar `r_enableCascadeShadows=0`): ~1000 draws a menos por
+  quadro, Santuário 48 → **50,7 FPS** (+6%), mas a cena fica mais clara e lisa.
+- Lançador: os scripts de preparação não fecham mais quando o console recusa escrita (issue #104
+  do repositório oficial).
+
+## 0.64-cp-mt — 2026-10-17 (fork Lucas-blip-png, branch cp-mt)
+- **Motor compilado com otimização guiada por perfil (PGO)**, treinado no Santuário (modo normal) e
+  com um save após o 1º colosso no modo PS4 Pro (cinemático e desempenho). Mesmo código da 0.63.
+  Santuário: 40,8 / 41,4 → **42,9 / 47,3 FPS** (média +9,7%).
+
+## 0.63-cp-mt — 2026-10-17
+- **Primeira passagem por cada área muito mais lisa:** dois avisos do tradutor de shaders
+  (`Unexpected instruction for offset computation, Phi` ~1000 vezes por sessão e `Patched SRT
+  walker` até ~500) eram escritos no log na hora da tradução e do carregamento; cada linha vai por
+  pipe até o lançador e levava milissegundos. Agora só as 4 primeiras. Cache vazio: tradução
+  15,6 → **3,0 s** por sessão; travada ao carregar o save 7,8 → **1,4 s**; a da abertura sumiu.
+
+## 0.62-cp-mt — 2026-10-17
+- **Fim do solavanco a cada 5 segundos** com "mostrar FPS" ligado (`SOTC_FPS=1`): as linhas de
+  estatística eram escritas durante o flip do quadro. Agora uma thread própria escreve o log.
+  Santuário: pior quadro a cada 5 s ~125 → **~34 ms**, FPS igual.
+
+## 0.61-cp-mt — 2026-10-17
+- **Modo PS4 Pro muito mais rápido em várias cenas:** com o Pro o jogo lê metadados da GPU (CMask)
+  como buffer/textura centenas de vezes por segundo, e cada leitura escrevia um aviso no log a
+  partir da thread de desenho. Agora só os 4 primeiros. Cena pós-colosso: cinemático 22,5 →
+  **39,3 FPS**; desempenho 28–44 → **40–46 FPS**.
+
+## 0.60-cp-mt — 2026-10-17
+- Integra o `main` da fork de Oussama268 (0.57-opt5, entradas abaixo): pipelines em segundo plano,
+  cortes por draw na CP, mip tails, memória de buffers devolvida em sessões longas.
+- Corrige duas corridas no cache de texturas: o toque no LRU de `GetImage` só acontece com o lock,
+  e a busca do stencil em `FindDepthTarget` pega o lock.
+
+## 0.59-cp-mt — 2026-10-17
+- **Modo PS4 Pro: fim do crash ao carregar o save.** Um PS4 Pro dá 640 MiB a mais aos jogos; com
+  o tamanho do PS4 normal o alocador do próprio jogo ficava sem páginas (leitura de -1 em guest
+  offset 0x1a371). Com `SOTC_NEO=1` o port informa 5696 MiB.
+- **Modo PS4 Pro: fim da tela preta ao desligar o Pro.** O cache de shaders feito com o Pro deixava o
+  modo normal preto; o Pro agora usa a pasta `CUSA08809_neo`.
+
+## 0.58-cp-mt — 2026-10-16
+- **Processador de comandos em duas threads** (`SOTC_CP_THREADS=0` desliga): uma lê os comandos do
+  jogo e escolhe os pipelines, a outra (`shadPS4:GpuDraw`) liga recursos e grava os comandos
+  Vulkan. Varredura DMA incremental. Santuário ~29 → ~40 FPS (com os PRs #46/#47/#48/#52/#53/#59).
+
+## 0.57-opt5 — 2026-10-17 (fork Oussama268)
+- **Sessões longas sem a memória de vídeo crescer:** o jogo mantém mapeado o seu bloco de 4 GB
+  de memória e reaproveita os endereços o tempo todo, então a memória de buffers na GPU só
+  crescia (~45 MB por minuto no demo da tela de título: 1,6 → 4,3–4,4 GB em 30 minutos). Numa
+  placa de 6 GB isso passava do orçamento depois de ~40 minutos de jogo e os engasgos voltavam.
+  Agora, quando a memória de buffers passa de 1,5 GB, os blocos que não foram usados há 30
+  segundos e não têm dados escritos pela GPU são devolvidos (no máximo 64 MB a cada 2 segundos,
+  ~20 ms cada vez). Antes de devolver, o port lê o bloco de volta e compara com a memória do jogo,
+  então a imagem não muda. Em 30 minutos de demo: pico de memória de vídeo **3,4 GB, estável**
+  (antes 4,3–4,4 GB e subindo), nenhuma coleta de emergência. `SOTC_ARENA_EVICT_MB=0` desliga;
+  `SOTC_ARENA_EVICT_MB`, `SOTC_ARENA_EVICT_IDLE_S` e `SOTC_ARENA_EVICT_STEP_MB` ajustam.
+- **Mundo aberto um pouco mais rápido:** quando um comando escreve numa página que o jogo vai ler
+  de volta, o port já manda o trabalho para a GPU (`SOTC_RB_EARLY`, agora padrão). Demo: 55,0 →
+  56,2 FPS (+2%); santuário igual.
+- **Correção de queda rara:** a 0.57-opt4 às vezes fechava ao carregar o save com o erro
+  "Attempted to protect region as write-only" (2 vezes em ~16 testes no santuário). A causa
+  provável foi corrigida e, se ainda acontecer, a página é protegida por inteiro e o jogo segue;
+  o log (`user/last_run.log`) registra a linha "Write-only protection" para investigação.
+- Perfil PGO refeito para o código novo.
+- Diagnóstico: com `SOTC_FPS=1` o log mostra a linha `SOTC ARENA` (memória devolvida).
+- Testado: 30 minutos de demo (memória estável), 15 minutos com o build final, demo e santuário
+  sem erro (pares intercalados contra a 0.57-opt4), imagens iguais (folha de capturas).
+
+## 0.57-opt4 — 2026-10-16 (fork Oussama268)
+- **Mais FPS em todo lugar:** a thread que transforma os comandos do jogo em comandos Vulkan (o
+  gargalo do port) gastava ~42% do tempo dentro do Windows e da biblioteca C: travas, mudanças de
+  proteção de página, cópias e alocações. Medido contra a 0.57-opt3, no mesmo PC e na mesma hora
+  (RTX 3060 Laptop, pares intercalados):
+  - Santuário: 29,3 / 29,1 → **35,0 / 34,1 FPS** (+18%).
+  - Demo da tela de título: 47,4 → **53,5 FPS**, 1% low 29,4 → **37,9**, quadros acima de 50 ms
+    129 → **26**.
+- **O que mudou:**
+  - A trava do cache de texturas é pega uma vez por grupo de texturas, não duas por textura (62
+    mil vezes por quadro), e do lado da thread de comandos ficou sem instrução atômica. Falhas de
+    escrita do jogo em páginas sem textura nem passam pela trava. `SOTC_TC_BATCH=0`,
+    `SOTC_TC_BIASED=0` e `SOTC_TC_SKIP_EMPTY=0` desligam as partes.
+  - As tabelas que o jogo preenche todo quadro com um shader de cópia (feito na CPU pelo port) são
+    comparadas página por página, e só as páginas que mudaram são escritas, direto na memória da
+    GPU, sem marcar a memória como alterada: os envios de buffers por quadro caíram de 21 para
+    ~13 MB. `SOTC_FILL_HLE_PAGES=0` volta ao jeito antigo.
+  - Um par de imagens de profundidade 960x540 era criado e destruído todo quadro; agora é
+    reaproveitado ("depth twin", que já existia como opção e passou a ser o padrão).
+    `SOTC_DEPTH_TWIN=0` desliga.
+  - Buscas de memória mais rápidas: cache maior das regiões de memória do jogo por thread
+    (`SOTC_REGION_DIRECT=0` desliga), cache das faixas de buffer já residentes, relógio lido a cada
+    8 comandos.
+  - Perfil PGO refeito para o código novo.
+- Diagnóstico: com `SOTC_CMD_STATS=1` o log mostra a linha `SOTC sys/frame` (proteções de página,
+  travas, alocações de memória de vídeo por quadro).
+- Testado: santuário e demo sem erro, imagens iguais (folha de capturas), 15 minutos de demo.
+## 0.57-opt3 — 2026-10-16 (fork Oussama268)
+- **Menos travadas na primeira visita a uma área:** os pipelines gráficos novos agora são
+  montados em threads separadas, e o objeto que precisa de um pipeline ainda em montagem não é
+  desenhado por alguns quadros (aparece um instante depois) em vez de o jogo inteiro parar. Com o
+  cache de shaders vazio, no demo da tela de título: quadros acima de 50 ms 235 → 156, 1% low
+  23,9 → 29,1 FPS. Passes de tela cheia (pós-processamento) continuam sendo montados na hora,
+  para não aparecer quadro preto. `SOTC_ASYNC_SHADERS=0` volta ao comportamento antigo.
+- A tradução dos shaders (a maior parte do que sobrou da travada) ainda roda na thread principal
+  de comandos; levá-la para segundo plano é o próximo passo.
+- A pasta de patches de shader é listada uma vez só, em vez de duas consultas ao disco por shader.
+- Diagnóstico: com `SOTC_FPS=1`, a linha `SOTC COMPILE` mostra onde vai o tempo de compilação.
+- Testado: 15 minutos de demo com cache vazio sem erro; com cache cheio, santuário 32,4 FPS e
+  demo 50,0 FPS (sem perda).
+
+## 0.57-opt2 — 2026-10-16 (fork Oussama268)
+- **Muito menos engasgos ao entrar em áreas novas (placas de 6 GB):** texturas cujo T# começa num
+  nível de mip acima de 0 nunca usam os mips mais finos, mas o port guardava a cadeia inteira na
+  memória de vídeo. Agora essas texturas só de leitura guardam apenas os mips usados ("mip tail").
+  No demo da tela de título o pico de memória de vídeo caiu de ~6,1 GB para ~3,4 GB numa placa
+  de 6 GB, os quadros acima de 50 ms caíram de 150 para ~105 e o pior quadro ao carregar uma área
+  de 460 ms para ~280 ms. Imagem idêntica. `SOTC_MIP_TAIL=0` desliga.
+- **Leituras da GPU assíncronas por padrão:** quando o jogo lê memória escrita pela GPU (todo
+  quadro), só a thread do jogo espera a GPU; o processador de comandos segue trabalhando. Santuário
+  29,2 → 30,7 FPS; no demo, ~25% menos quadros acima de 50 ms. `SOTC_RB_ASYNC=0` desliga.
+- **Memória de buffers devolvida ao desmapear:** antes ela nunca voltava e a memória de vídeo
+  crescia ~90 MB por minuto (1,6 → 6,0 GB em 48 minutos no demo), até faltar memória. Agora cresce
+  bem mais devagar (24 minutos: 4,1 GB em vez de 4,8–5,0 GB). Era opcional por causa de uma queda
+  antiga ao carregar save, que não se repetiu nos testes (3 carregamentos, 25 minutos de demo).
+  `SOTC_ARENA_RELEASE=0` volta ao comportamento antigo.
+- Com tudo isso ligado, o demo rodou a 49,9 FPS de média com 47 quadros acima de 50 ms (antes:
+  ~47 FPS e 100–150).
+- **Quedas deixam registro:** o lançador guarda os logs das últimas 5 sessões (`last_run.1.log`
+  …) e copia o log de uma sessão que terminou com erro para `user/crashes/`; o bb-probe grava ali
+  um minidump (`.dmp`) quando o jogo cai. `SOTC_MINIDUMP=0` desliga o dump.
+- **Relatório de engasgos para desenvolvedores:** com `SOTC_FPS=1` o log mostra a cada 5 s o
+  tempo de quadro (mediana, 1% low, pior quadro) e onde foi o tempo dos quadros lentos;
+  `tools/frame_report.py` resume um log.
+- Memória de buffers em blocos de 4 MB em vez de uma alocação por pedido (`SOTC_ARENA_SLAB_MB`),
+  cópia de envios grandes em paralelo (`SOTC_COPY_BATCH`).
+- **Ainda não resolvido:** na primeira vez em cada área os shaders são compilados e o jogo engasga
+  (até 1–2 s); da segunda vez em diante fica liso. Compilação em segundo plano é o próximo passo.
+- Na primeira abertura alguns shaders novos são compilados (poucos segundos); o cache existente
+  continua valendo.
+
 ## 0.57 — 2026-10-14
 - **Placas AMD: correção das cores verdes/rosas** na névoa, no Wander e no Agro (issues #6, #7, #9,
   possivelmente #10). A AMD informa grupos de 64 threads, mas só deixa fixar esse tamanho nos

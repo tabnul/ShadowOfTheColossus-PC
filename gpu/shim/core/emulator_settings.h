@@ -26,8 +26,6 @@ public:
     u32 GetInternalScreenHeight() { static const auto value = u32(Number("BB_INTERNAL_HEIGHT", 1080)); return value; }
     std::string GetPresentMode() { const char* v = std::getenv("BB_PRESENT_MODE"); return v ? v : "Mailbox"; }
     int GetRcasAttenuation() { static const auto value = int(Number("BB_RCAS_ATTENUATION", 250)); return value; }
-    // bbport: Relaxed by default: without readbacks FaceGen reads stale GPU-written vertices
-    // (vertex explosions); in Hunter's Nightmare it costs no measurable frame rate.
     // sotc: Precise: Shadow of the Colossus reads GPU results the frame they are written (as in
     // the shadPS4 SotC fork); relaxed readbacks leave it with stale data.
     u32 GetReadbacksMode() { static const auto value = u32(Number("BB_READBACKS", GpuReadbacksMode::Precise)); return value; }
@@ -59,6 +57,9 @@ public:
     bool IsDirectMemoryAccessEnabled() { static const auto value = Flag("BB_DIRECT_MEMORY_ACCESS", true); return value; }
     bool IsDumpShaders() { static const auto value = Flag("BB_DUMP_SHADERS", false); return value; }
     bool IsFsrEnabled() { static const auto value = Flag("BB_FSR1", false); return value; }
+    // sotc: frame generation (FSR 3.1.6 frame interpolation, docs/sotc/FRAMEGEN.md). Off: the
+    // device is created and frames are presented exactly as without it.
+    bool IsFrameGenEnabled() { static const auto value = Flag("SOTC_FG", false); return value; }
     bool IsHdrAllowed() { static const auto value = Flag("BB_HDR", false); return value; }
     bool IsNullGPU() { static const auto value = Flag("BB_NULL_GPU", false); return value; }
     bool IsPatchShaders() { return false; }
