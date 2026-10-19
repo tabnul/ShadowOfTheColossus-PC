@@ -85,6 +85,8 @@ def cap_render(size):
         w, h = map(int, size.split('x'))
     except ValueError:
         return size  # sotc_modes.py reports it
+    if os.environ.get('SOTC_RENDER_UNCAPPED') == '1':
+        return size  # test switch: render at the requested size, detail loss and all
     scale = min(1.0, MAX_RENDER_HEIGHT / h, (MAX_RENDER_PIXELS / (w * h)) ** 0.5)
     if scale == 1.0:
         return size
