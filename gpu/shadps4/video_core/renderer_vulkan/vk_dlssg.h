@@ -27,6 +27,7 @@ class TextureCache;
 namespace Vulkan {
 class Instance;
 class Runtime;
+class Scheduler;
 }
 
 namespace Vulkan::Dlssg {
@@ -51,13 +52,54 @@ bool WantsImmediatePresent();
 /// Command processor thread, at each draw: the first G-buffer draw of the frame gives the
 /// camera (guest view constants) and the depth and motion vector images.
 void NoteDraw(const AmdGpu::Regs& regs, u32 mrt_mask, VideoCore::ImageId depth_id,
-              VideoCore::ImageId mvec_id, VideoCore::TextureCache& texture_cache);
+              VideoCore::ImageId mvec_id, VideoCore::TextureCache& texture_cache,
+              Runtime& runtime, Scheduler& scheduler);
 
 /// Command processor thread, in PrepareFrame (no rendering active on cmdbuf): copies this
 /// frame's depth and motion vectors into images of presentation frame `frame_id` and sets the
 /// frame's constants. Frames without a G-buffer pass get no inputs (DLSS-G off).
 void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_cache,
                    Runtime& runtime, u32 game_width, u32 game_height);
+
+/// DLSS Super Resolution (SOTC_UPSCALER=dlss) is supported on this device.
+bool SuperResolution();
+
+/// DLSS Super Resolution works on this device, also while F9 has it switched off.
+bool SuperResolutionAvailable();
+
+/// SOTC_DLSS_COMPARE=1 (launcher debug option): F9 compares DLSS with FSR1, a label shows which.
+bool CompareMode();
+
+/// The DLSS mode in use ("DLSS Quality", ...), for the compare label.
+const char* ModeName();
+
+/// Window thread, F9 in compare mode: switch DLSS super resolution off (FSR1 and the game's
+/// TAA) and back on.
+void ToggleSuperResolution();
+
+/// Depth, motion vectors and camera are needed (frame generation or super resolution).
+bool CapturingInputs();
+
+/// Command processor thread, at the game's final composite draw (UI layer over the scene, into
+/// a video out surface): the scene before the UI and the UI layer of this frame.
+/// sotc: the tonemap's vignette (start, end, radius scale, strength), applied after DLSS instead.
+void NoteVignette(const float params[4]);
+bool Vignette(float out[4]);
+
+void NoteComposite(VideoCore::ImageId scene_id, VideoCore::ImageId ui_id,
+                   VideoCore::TextureCache& texture_cache);
+
+struct Upscaled {
+    vk::ImageView scene; ///< linear colour at the output size, shader read only
+    vk::ImageView ui;    ///< the game's UI layer (premultiplied, sRGB view), render size
+    vk::ImageView sky;   ///< render size, g = 1 in the sky; empty without camera motion fill
+};
+
+/// Command processor thread, in PrepareFrame after PrepareInputs: DLSS upscales this frame's
+/// scene to width x height. Empty when this frame has no composite or no inputs (menus,
+/// loading screens): the game image is presented as before.
+Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& texture_cache,
+                 Runtime& runtime, u32 width, u32 height);
 
 /// Command processor thread, after the frame's commands are flushed.
 void FrameSubmitted(u32 frame_id);
