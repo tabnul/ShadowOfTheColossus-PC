@@ -4,7 +4,8 @@ user/
 *.mp4
 bbport.ini
 fsr4_shaders/
-pgo/
+pgo/*
+!pgo/bbgpu.profdata
 *.png
 last_run.log
 dist/
