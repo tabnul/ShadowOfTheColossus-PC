@@ -450,9 +450,16 @@ void VideoOutDriver::Flip(const Request& req) {
                                  static_cast<unsigned long long>(SotcStats::host_heap_usage.load() >> 20),
                                  static_cast<unsigned long long>(SotcStats::host_vma_block_bytes.load() >> 20));
                 }
-                // sotc: heaps vs other private memory, every 12th report (a minute at 5 s).
+                // sotc: heaps vs other private memory, every 12th report (a minute at 5 s). Only
+                // with SOTC_MEM_REPORT=1: HeapSummary holds each heap's lock while it walks it
+                // and the address space walk takes long, a 130-200 ms hitch every minute
+                // (every thread that allocates waits, the draw thread too).
+                static const bool mem_report = [] {
+                    const char* v = std::getenv("SOTC_MEM_REPORT");
+                    return v && std::atoi(v) != 0;
+                }();
                 static u32 mem_reports = 0;
-                if (mem_reports++ % 12 == 0) {
+                if (mem_report && mem_reports++ % 12 == 0) {
                     if (const std::string mem = BbMemReport::Line(); !mem.empty()) {
                         ReportPrintf(report, "SOTC MEM %s\n", mem.c_str());
                     }
