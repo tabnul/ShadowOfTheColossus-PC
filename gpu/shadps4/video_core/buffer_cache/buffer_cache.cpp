@@ -775,11 +775,20 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
     // frame, one after another, so while the GPU is idle anyway also bring along the other
     // regions read back recently ("hot" readbacks) that the GPU has modified since. The reads
     // that follow then find their data already on the CPU instead of each needing a sync.
-    // SOTC_RB_HOT=0: off, 1: same arena and small regions only, 2 (default): any existing arena,
-    // any size. Mode 2 halves the readback syncs in SotC's open world (~+20% fps).
+    // SOTC_RB_HOT=0: off, 1 (default): same arena and small regions only, 2: any existing arena,
+    // any size. sotc: off from 22 Oct, on again (mode 1) on 23 Oct with the late check in
+    // ApplyDownloads (pages the CPU wrote since the gather are skipped); the user's recipe (new
+    // area, reload the save, 3 times) stayed clean with it. Shrine idle 34.6 -> 43.3 FPS.
+    // Before that, without the check, those speculative copies landed on memory the game may have
+    // reused since: rainbow, striped garbage on the Shrine's stones after loading a save again, and
+    // heap free lists corrupted (0x49500, the game closing "out of nowhere", once after 23 min idle
+    // in the title demo); with them off the user's recipe (a new area, then reload the save, 3
+    // times) stayed clean. Attract demo, full settings: 54.8 / 36.4 FPS off against ~57 / 40 with
+    // mode 2. Keeping the hot data aside until the guest reads it (no speculative writes) cost more
+    // than it saved (42.7 / 23.5): copying it on the command processor thread.
     static const int hot_mode = [] {
         const char* v = std::getenv("SOTC_RB_HOT");
-        return v ? std::atoi(v) : 2;
+        return v ? std::atoi(v) : 1;
     }();
     const bool hot_enabled = hot_mode != 0;
     const auto now = std::chrono::steady_clock::now();
@@ -830,8 +839,16 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
     }
 
     u64 total_size_bytes = 0;
-    for (const Region& region : regions) {
+    for (size_t region_index = 0; region_index < regions.size(); ++region_index) {
+        const Region& region = regions[region_index];
+        // sotc: a hot region (brought along, not asked for) skips the pages whose CPU bit is set:
+        // the guest may have written them since (repeat-fault grace leaves hot pages writable),
+        // and its bytes are the right ones. Applying the GPU copy there wrote what the GPU drew
+        // before the game reused the memory over new textures (rainbow garbage on the Shrine's
+        // stones after a save reload, 22 Oct; SOTC_RB_HOT=0 made it go away).
+        const bool hot_region = region_index > 0;
         ReadbackItem item{region.arena, region.addr, region.size, {}};
+        item.hot = hot_region;
         const u64 total_before = total_size_bytes;
         const VAddr arena_base = region.arena->cpu_addr;
         memory_tracker->ForEachDownloadRange<false>(
@@ -856,8 +873,30 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
                             total_size_bytes += Common::AlignUp(b - a, align);
                         });
                 };
-                gpu_modified_ranges.ForEachInRange(address, range_size, add_download);
-                item.gpu_ranges.emplace_back(address, range_size);
+                if (!hot_region) {
+                    gpu_modified_ranges.ForEachInRange(address, range_size, add_download);
+                    item.gpu_ranges.emplace_back(address, range_size);
+                    return;
+                }
+                // Page by page: runs of pages the CPU has not touched.
+                VAddr run_start = address;
+                const VAddr range_end = address + range_size;
+                const auto flush_run = [&](VAddr end) {
+                    if (end > run_start) {
+                        gpu_modified_ranges.ForEachInRange(run_start, end - run_start, add_download);
+                        item.gpu_ranges.emplace_back(run_start, end - run_start);
+                    }
+                };
+                for (VAddr page = address; page < range_end;) {
+                    const VAddr next = std::min(Common::AlignDown(page, 4_KB) + 4_KB, range_end);
+                    if (memory_tracker->IsRegionCpuModified(page, next - page)) {
+                        flush_run(page);
+                        run_start = next;
+                        SotcStats::rb_hot_cpu_skipped.fetch_add(next - page, std::memory_order_relaxed);
+                    }
+                    page = next;
+                }
+                flush_run(range_end);
             });
         if (item.copies.empty()) {
             if (subtract) {
@@ -961,7 +1000,8 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         // colossus' area, after the ending) grow in 1 MiB pieces over direct memory and share that
         // +0x28 pointer, so readbacks into them were never guarded and the ending still crashed
         // in their free lists (eboot+0x49500): their range comes from their own guard's free
-        // blocks, refreshed every 2 s while their free tree changes.
+        // blocks, refreshed every 2 s while their free tree changes, and after 250 ms already when
+        // a readback lands outside the range (a piece the heap may have added since).
         VAddr heap_base = *std::bit_cast<const VAddr*>(heap + 0x28);
         u64 heap_size = *std::bit_cast<const u64*>(heap + 0x30);
         GuardSlot* known = nullptr;
@@ -972,8 +1012,21 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
             }
             const auto now = std::chrono::steady_clock::now();
             const auto signature = signature_of(heap);
+            const auto outside_extent = [&] {
+                if (!known->guard || !known->guard->IsValid()) {
+                    return true;
+                }
+                const auto [lo, hi] = known->guard->FreeExtent();
+                constexpr u64 Margin = 1ULL << 20;
+                return std::any_of(pending.begin(), pending.end(), [&](const ReadbackItem& item) {
+                    return item.addr + Margin < lo || item.addr + item.size > hi + Margin;
+                });
+            };
+            const auto age = now - known->built;
             if (!known->guard ||
-                (signature != known->signature && now - known->built > std::chrono::seconds(2))) {
+                (signature != known->signature &&
+                 (age > std::chrono::seconds(2) ||
+                  (age > std::chrono::milliseconds(250) && outside_extent())))) {
                 SotcStats::heap_guard_builds.fetch_add(1, std::memory_order_relaxed);
                 known->guard.emplace(memory, heap);
                 known->signature = signature;
@@ -1089,7 +1142,25 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                     SotcStats::readback_bytes_changed.fetch_add(changed, std::memory_order_relaxed);
                 }
             }
-            ForEachNonStackRange(dst_addr, copy.size, [&](VAddr addr, u64 size) {
+            // sotc: hot data is applied only to pages the guest has not written since the
+            // gather: a write fault during the GPU wait (the range was still GPU-modified, or
+            // its page left writable by the fault grace) set the CPU bit, and the guest's bytes
+            // are the right ones. Checked again here, page by page, and written under the page's
+            // region lock, so a write fault in between waits instead of being overwritten (the
+            // game's resource loader crashed asking for 59 GiB once, 24 Oct: a size it had just
+            // read from a file, replaced by stale GPU bytes).
+            const auto write_pages = [&](VAddr start, u64 size, auto&& write) {
+                if (!item.hot) {
+                    write(start, size);
+                    return;
+                }
+                const u64 skipped = memory_tracker->WriteUnlessCpuModified(start, size, write);
+                if (skipped) {
+                    SotcStats::rb_hot_late_skipped.fetch_add(skipped, std::memory_order_relaxed);
+                }
+            };
+            write_pages(dst_addr, copy.size, [&](VAddr part_addr, u64 part_size) {
+            ForEachNonStackRange(part_addr, part_size, [&](VAddr addr, u64 size) {
                 BpeHeapGuard* heap_guard = nullptr;
                 if (Active* a = active_for(addr, size)) {
                     BpeUsedBlocks& used = *a->slot->used;
@@ -1123,6 +1194,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                 }
                 memory->TryWriteBacking(std::bit_cast<u8*>(addr), src + (addr - dst_addr), size,
                                         1);
+            });
             });
         }
         memory_tracker->UnmarkRegionAsGpuModified(item.addr, item.size, false);

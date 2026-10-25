@@ -231,6 +231,9 @@ public:
     }
     /// Command processor: waits until the draw thread ran everything queued.
     void DrainBack();
+    /// sotc: frees a finished nested command buffer task's frame once the draw thread has run
+    /// the work queued until now (PR #219 freed it at once: garbage textures, heap corruption).
+    void FreeTaskFrame(std::coroutine_handle<> frame);
     /// True on the command processor thread while the draw thread does the GPU work.
     bool RunsGpuWorkElsewhere() const noexcept {
         return back_threaded && std::this_thread::get_id() == gpu_id;
@@ -276,6 +279,11 @@ private:
                 }
             }
             void return_void() {}
+            /// sotc: SOTC_TASK_GUARD=1 gives every task frame pages of its own that become
+            /// inaccessible when it is freed (and stay so for a while): a later read of a freed
+            /// frame faults where it happens (hunting the garbage textures of PR #219).
+            static void* operator new(std::size_t size);
+            static void operator delete(void* frame, std::size_t size);
             struct empty {};
             std::suspend_always yield_value(empty&&) {
                 return {};
@@ -307,6 +315,19 @@ private:
         std::queue<Task::Handle> submits{};
         std::queue<u64> submit_seqs{}; // sotc: guest submit order of `submits`
         ComputeProgram cs_state{};
+        // sotc: lock-free hint for Process()'s round-robin so it can skip m_access entirely for
+        // queues with nothing queued, instead of locking every queue every pass just to find
+        // most of them empty. Set true under the lock on push, re-synced under the lock on pop;
+        // read without the lock as a hint only (a stale false just defers that queue to the next
+        // pass - num_submits keeps the outer loop going - a stale true costs one wasted lock).
+        //
+        // A single shared bitmask + bit-scan (std::countr_zero) to jump straight to the next
+        // queue with work, instead of this per-queue flag, measured *worse* here: it drains each
+        // batch faster, so submit_cv parks and wakes this thread more often for the same work,
+        // and each wake is a costlier kernel round-trip on Windows than the iterations it saves
+        // (own-code share 23.3%->16%, but ntdll wait share 37%->45%, reproduced over 2 runs).
+        // Keep the simpler per-queue hint; see git history for the bitmask version and numbers.
+        std::atomic<bool> has_work{false};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
     u32 num_mapped_queues{1u}; // GFX is always available
@@ -453,6 +474,8 @@ private:
     std::vector<BackOp> back_ring;
     std::atomic<u64> back_head{0};
     std::atomic<u64> back_tail{0};
+    /// sotc: finished task frames and the back_head they wait for (FreeTaskFrame)
+    std::vector<std::pair<std::coroutine_handle<>, u64>> finished_frames;
     std::atomic<bool> back_sleeping{false};
     std::atomic<bool> drain_waiting{false};
     std::mutex back_mutex;

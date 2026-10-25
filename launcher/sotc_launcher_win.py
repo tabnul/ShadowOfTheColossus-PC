@@ -13,6 +13,7 @@ so a packaged port needs no Python installation.
 import ctypes
 import json
 import os
+import platform
 from pathlib import Path
 import queue
 import runpy
@@ -35,9 +36,12 @@ LEGACY_CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'sotc-launche
 LEGACY_CONFIG_FILE = LEGACY_CONFIG_DIR / 'settings.json'
 CONFIG_DIR = PORT_DIR / 'user'
 CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
-GAME_ID, GAME_VERSION = 'CUSA08809', '01.01'
+# The supported releases (title ID -> region, version) share one eboot build; scripts/ is on
+# sys.path above. The EU one (CUSA08809) is the default game folder.
+from sotc_modes import GAMES  # noqa: E402
+GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.60.4-opt9'
+VERSION = '0.60.6-opt11'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -60,6 +64,32 @@ def attach_stdio():
             except OSError:
                 stream = None
         setattr(sys, name, stream or open(os.devnull, 'w'))
+    # An inherited handle can exist and still refuse writes ("[Errno 22] Invalid argument" from a
+    # print in link_modules.py, issue #104 upstream): this output is informational, so a failed
+    # write drops the stream instead of aborting the preparation.
+    for name in ('stdout', 'stderr'):
+        setattr(sys, name, _TolerantStream(getattr(sys, name)))
+
+
+class _TolerantStream:
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        try:
+            return self._stream.write(text)
+        except (OSError, ValueError):
+            self._stream = open(os.devnull, 'w')
+            return len(text)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except (OSError, ValueError):
+            pass
+
+    def __getattr__(self, attr):
+        return getattr(self._stream, attr)
 
 
 def run_role(argv):
@@ -128,9 +158,9 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'hq_textures': True, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'hdr': False, 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'textures': 'high', 'hdr': False, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
-                'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
+                'readbacks': '', 'extra_env': '', 'close_on_play': False, 'skip_logos': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
@@ -265,6 +295,11 @@ BUTTON_ICONS = [('ps', ('PlayStation (do jogo)', 'PlayStation (the game\'s)')),
 FPS_MODES = [('30', ('30 FPS (como no PS4)', '30 FPS (as on PS4)')),
              ('60', ('60 FPS (modo 60 do jogo)', "60 FPS (the game's 60 FPS mode)")),
              ('unlimited', ('Ilimitado (acima de 60)', 'Unlimited (above 60)'))]
+# Texture level (#235): off (the game's 256x256 mips), high (fine mips streamed, coarser while the
+# game's page pool is low) or maximum (always fine; may close in very wide views in PS4 Pro mode).
+TEXTURES = [('off', ('Desligada', 'Off')),
+            ('high', ('Alta (estável)', 'High (stable)')),
+            ('max', ('Máxima (nítida, pode fechar no modo Pro)', 'Maximum (sharp, may close in Pro mode)'))]
 # Frame generation (bb-probe: SOTC_FRAMEGEN; F8 in game switches off / DLSS-G / FSR 3).
 FRAMEGEN = [('off', ('Desligada', 'Off')),
             ('auto', ('Automática (DLSS-G ou FSR 3, experimental)', 'Automatic (DLSS-G or FSR 3, experimental)')),
@@ -315,30 +350,32 @@ def load_json(path, default):
         return default
 
 
-_EBOOT_VERSIONS = {}
+_EBOOT_SUPPORTED = {}
 
 
-def eboot_version(eboot):
-    """'01.01' when the eboot holds the EU 1.01 code the modes patch (dumps often keep the base
-    game's param.sfo next to the updated eboot), else None. Cached per file state."""
+def eboot_supported(eboot):
+    """True when the eboot holds the code the modes patch (EU 1.01 and US 1.00 are the same
+    build; dumps often keep the base game's param.sfo next to the updated eboot). Cached per file
+    state."""
     try:
         stat = eboot.stat()
     except OSError:
-        return None
+        return False
     key = (str(eboot), stat.st_size, stat.st_mtime_ns)
-    if key not in _EBOOT_VERSIONS:
+    if key not in _EBOOT_SUPPORTED:
         try:
             from prepare import parse_self
             from sotc_modes import is_supported
             elf, _h, ph, _s, _m = parse_self(eboot.read_bytes())
-            _EBOOT_VERSIONS[key] = GAME_VERSION if is_supported(elf, ph) else None
+            _EBOOT_SUPPORTED[key] = is_supported(elf, ph)
         except (OSError, ValueError, ImportError):
-            _EBOOT_VERSIONS[key] = None
-    return _EBOOT_VERSIONS[key]
+            _EBOOT_SUPPORTED[key] = False
+    return _EBOOT_SUPPORTED[key]
 
 
 def game_info(folder):
-    """(title id, game version) of a game folder, or None without eboot.bin."""
+    """(title id, game version) of a game folder, or None without eboot.bin. A supported release
+    shows its version (EU 01.01, US 01.00) whatever its param.sfo says."""
     folder = Path(folder or '.')
     if not (folder / 'eboot.bin').is_file():
         return None
@@ -348,12 +385,32 @@ def game_info(folder):
         title, version = values.get('TITLE_ID', '?'), values.get('APP_VER', '?')
     except (OSError, ValueError, ImportError):
         title, version = '?', '?'
-    return title, eboot_version(folder / 'eboot.bin') or version
+    if title in GAMES and eboot_supported(folder / 'eboot.bin'):
+        version = GAMES[title][1]
+    return title, version
+
+
+def game_supported(folder):
+    """True for a supported release (EU or US) whose eboot the modes patch."""
+    info = game_info(folder)
+    return bool(info) and info[0] in GAMES and eboot_supported(Path(folder) / 'eboot.bin')
+
+
+def game_serial(folder):
+    """The title ID of the game folder, for its saves and DLC; CUSA08809 (EU) when unknown."""
+    info = game_info(folder) if folder else None
+    return info[0] if info and info[0] in GAMES else GAME_ID
+
+
+def supported_games():
+    """'CUSA08809 01.01, CUSA08034 01.00' for messages."""
+    return ', '.join(f'{serial} {version}' for serial, (_region, version) in GAMES.items())
 
 
 def user_dir(s):
-    """The data folder (saves in savedata/1/CUSA08809 below it). A folder picked one level too
-    deep (savedata itself, or a save folder) is taken back up to the data folder."""
+    """The data folder (saves in savedata/1/<title id> below it: CUSA08809 EU, CUSA08034 US). A
+    folder picked one level too deep (savedata itself, or a save folder) is taken back up to the
+    data folder."""
     folder = Path(s.get('user_dir') or PORT_DIR / 'user')
     parts = [p.lower() for p in folder.parts]
     if 'savedata' in parts:
@@ -398,6 +455,71 @@ def keep_crash_log(log_dir, code):
         pass
 
 
+def start_event_log(log_dir, settings, env):
+    """user/events.log: one line per event of the session (src/runtime_event.h), for players and
+    developers to read. The launcher writes the header (date, version, system, every setting in
+    words) and the game appends its events (SOTC_EVENT_LOG). The last 5 sessions are kept."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(LOGS_KEPT - 1, 0, -1):
+        older = log_dir / ('events.log' if i == 1 else f'events.{i - 1}.log')
+        if older.is_file():
+            try:
+                os.replace(older, log_dir / f'events.{i}.log')
+            except OSError:
+                pass
+    path = log_dir / 'events.log'
+    words = lambda table, key, default='': dict((k, _(*v)) for k, v in table).get(settings.get(key) or default, str(settings.get(key)))
+    on_off = lambda value: _('ligado', 'on') if value else _('desligado', 'off')
+    lines = [
+        _('Shadow of the Colossus PC {} - sessão de {}', 'Shadow of the Colossus PC {} - session of {}').format(
+            VERSION, time.strftime('%Y-%m-%d %H:%M:%S')),
+        _('Windows {} | jogo: {}', 'Windows {} | game: {}').format(platform.version(), settings.get('game_dir') or '?'),
+        _('Saída: {} | Upscaler: {} | Nitidez: {}', 'Output: {} | Upscaler: {} | Sharpening: {}').format(
+            words(OUTPUTS, 'output_res', '1920x1080'), words(UPSCALERS, 'upscaler', 'fsr1'), words(SHARPNESS, 'sharpness', '250')),
+        _('FPS: {} | Texturas: {} | Filtro 16x: {} | Modo PS4 Pro: {}', 'FPS: {} | Textures: {} | 16x filtering: {} | PS4 Pro mode: {}').format(
+            words(FPS_MODES, 'fps_mode', '30'), words(TEXTURES, 'textures', 'high'), on_off(settings.get('af16')),
+            on_off(env.get('SOTC_NEO') == '1')),
+        _('Geração de quadros: {} | Memória de vídeo: {} | Sombras distantes: {} | Volume: {}%',
+          'Frame generation: {} | Video memory use: {} | Far shadows: {} | Volume: {}%').format(
+            words(FRAMEGEN, 'framegen', 'off'), words(VRAM_USE, 'vram_use', 'normal'),
+            on_off(str(settings.get('shadow_reuse') or '0') != '0'), settings.get('volume') or '100'),
+        _('Tela cheia: {} | Câmera pelo mouse: {} | Controle preferido: {} | Variáveis extras: {}',
+          'Fullscreen: {} | Mouse camera: {} | Preferred controller: {} | Extra variables: {}').format(
+            on_off(settings.get('fullscreen')), on_off(settings.get('mouse', True)),
+            settings.get('gamepad') or _('qualquer', 'any'), settings.get('extra_env') or _('nenhuma', 'none')),
+    ]
+    if env.get('SOTC_NOTE'):
+        lines.append(_('Aviso: {}', 'Note: {}').format(env['SOTC_NOTE']))
+    try:
+        with open(path, 'w', encoding='utf-8') as out:
+            for line in lines:
+                out.write(f'[00:00:00.000] [CONFIG  ] {line}' + chr(10))
+    except OSError:
+        return ''
+    return str(path)
+
+
+def end_event_log(log_dir, code, stopped=False):
+    """The end of the session in user/events.log; after a crash its copy goes to user/crashes."""
+    path = log_dir / 'events.log'
+    if code == 0 or stopped:
+        text = _('Jogo fechado normalmente', 'Game closed normally') if code == 0 else _('Jogo parado pelo lançador', 'Game stopped by the launcher')
+    elif code & 0xffffffff == 3:
+        text = _('O jogo caiu (código 3): o motivo está na linha ERROR acima e no log da sessão',
+                 'The game crashed (code 3): the reason is in the ERROR line above and in the session log')
+    else:
+        text = _('O jogo terminou com erro (código {:#x})', 'The game ended with an error (code {:#x})').format(code & 0xffffffff)
+    try:
+        with open(path, 'a', encoding='utf-8') as out:
+            out.write(f'[--:--:--.---] [SESSION ] {text}' + chr(10))
+        if code != 0 and not stopped:
+            crashes = log_dir / 'crashes'
+            crashes.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, crashes / (time.strftime('%Y-%m-%d_%H-%M-%S') + f'_{code & 0xffffffff:#x}_events.log'))
+    except OSError:
+        pass
+
+
 def short_path(path):
     """A path for display: relative to the port folder when inside it, else as is."""
     try:
@@ -428,6 +550,8 @@ def load_settings():
     settings = {**APP_DEFAULTS, **saved}
     if 'fps_mode' not in saved:  # before the choice: the "uncapped FPS" box
         settings['fps_mode'] = '60' if saved.get('fps60') else '30'
+    if 'textures' not in saved:  # before the levels: the "high quality textures" box
+        settings['textures'] = 'high' if saved.get('hq_textures', True) else 'off'
     if 'framegen' not in saved:
         extra = str(settings.get('extra_env', '')).split()
         if 'SOTC_DLSSG=1' in extra:
@@ -488,11 +612,11 @@ def game_environment(s):
     modes = ['af16'] if s.get('af16') else []
     if fps_mode != '30':
         modes.append('fps60game')
-    if s.get('hdr'):
-        modes.append('hdr')
     # At this resolution the grass overflows the game's grass buffers: the farthest grass then pops
     # in and out in patches, in a band ahead with longer grass distances. grassbuf makes them 4x larger.
     modes.append('grassbuf')
+    if s.get('hdr'):
+        modes.append('hdr')
     env['SOTC_MODES'] = ','.join(modes)
     env['SOTC_FPS_CAP'] = '30' if fps_mode == '30' else 'off'
     env['SOTC_FPS_LIMIT'] = '60' if fps_mode == '60' else '0'
@@ -514,6 +638,8 @@ def game_environment(s):
         # From Pink-shadPS4: no GPU index-buffer culling (always both), same image, far fewer
         # GPU results the CPU has to wait for.
         cvars += ['doIndexBufferCulling=0', 'doSunShadowIndexBufferCulling=0']
+    if s.get('skip_logos'):
+        cvars.append('skipSplash=1')
     grass = str(s.get('grass_shadows') or '2')
     if grass in ('3', '4'):
         # Every mode's copy: the game takes the one of its graphics mode (PS4 Pro Cinematic has 3).
@@ -549,8 +675,16 @@ def game_environment(s):
     # sotc: high quality textures: the texture banks sampled since the last report read as sampled
     # (sotc_lod_stats.h; before, none ever did and the game never streamed its fine mips: blurry
     # leaves and rocks). Off: the old behaviour, for cards short of video memory.
-    if s.get('hq_textures', True):
+    textures = s.get('textures') or 'high'
+    if textures != 'off':
         env.setdefault('SOTC_LOD_LINGER', '1')
+    if textures == 'max' and env['SOTC_NEO'] == '1':
+        # sotc: in PS4 Pro mode "Maximum" exhausted the game's page pool within minutes at the
+        # Shrine (0x1a371, user, 22 Oct): High there.
+        textures = 'high'
+        env['SOTC_NOTE'] = 'Texture quality Maximum is not used in PS4 Pro mode: High'
+    if textures == 'max':  # sotc: without the page pool switch (sotc_lod_stats.h)
+        env.setdefault('SOTC_LOD_POOL_LOW', '0')
     if s.get('button_icons') == 'xbox' and (PORT_DIR / 'glyphs' / 'xbox').is_dir():
         env['SOTC_TEX_REPLACE'] = str(PORT_DIR / 'glyphs' / 'xbox')
     env['SOTC_UI_LANG'] = s.get('ui_language') or windows_language()  # overlay and F7/F8 texts
@@ -618,13 +752,14 @@ def is_wide(size):
     return w * 9 > h * 16 * 1.02
 
 
-def shadps4_saves():
-    """Save folders of shadPS4 installations next to the port or in the usual places."""
+def shadps4_saves(serial):
+    """Save folders of the game serial in shadPS4 installations next to the port or in the usual
+    places."""
     roots = [PORT_DIR.parent, Path.home(), Path(os.environ.get('APPDATA', Path.home()))]
     found = []
     for root in roots:
-        for pattern in ('*/user/home/*/savedata/' + GAME_ID, '*/*/user/home/*/savedata/' + GAME_ID,
-                        'shadPS4/savedata/*/' + GAME_ID):
+        for pattern in ('*/user/home/*/savedata/' + serial, '*/*/user/home/*/savedata/' + serial,
+                        'shadPS4/savedata/*/' + serial):
             try:
                 found += [p for p in root.glob(pattern) if p.is_dir()]
             except OSError:
@@ -979,12 +1114,12 @@ class Launcher:
         self.row(quick, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(quick, 'sharpness', SHARPNESS, 24))
         self.row(quick, _('Geração de quadros', 'Frame generation'), self.choice(quick, 'framegen', FRAMEGEN, 24))
         self.row(quick, _('FPS', 'FPS'), self.choice(quick, 'fps_mode', FPS_MODES, 24))
+        self.row(quick, _('Texturas', 'Textures'), self.choice(quick, 'textures', TEXTURES, 24))
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
-        self.check(quick, 'hq_textures', _('Texturas em alta qualidade', 'High quality textures'))
         self.check(quick, 'hdr', _('HDR (HDR do Windows ligado)', 'HDR (Windows HDR on)'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.check(quick, 'neo', _('Modo PS4 Pro', 'PS4 Pro mode'))
-        for key in ('af16', 'hq_textures', 'fps_mode', 'hdr', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
+        for key in ('af16', 'textures', 'fps_mode', 'hdr', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
 
     def draw_banner(self):
@@ -1064,8 +1199,10 @@ class Launcher:
         self.library_label.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(4, 0))
         self.section(f, _('Jogo', 'Game'))
         self.folder(f, 'game_dir', _('Pasta do jogo', 'Game folder'), _('Pasta com eboot.bin', 'Folder with eboot.bin'),
-                    _('O dump CUSA08809 (versão europeia 1.01), com eboot.bin, sce_module e sce_sys.',
-                      'The CUSA08809 dump (EU version 1.01) with eboot.bin, sce_module and sce_sys.'),
+                    _('O dump CUSA08809 (versão europeia 1.01) ou CUSA08034 (versão americana 1.00), com eboot.bin, '
+                      'sce_module e sce_sys.',
+                      'The CUSA08809 dump (EU version 1.01) or CUSA08034 dump (US version 1.00) with eboot.bin, '
+                      'sce_module and sce_sys.'),
                     on_change=self.game_changed)
         self.section(f, _('Som', 'Sound'))
         self.folder(f, 'sys_modules', _('Módulos de som', 'Sound modules'),
@@ -1085,9 +1222,11 @@ class Launcher:
         self.section(f, _('DLC', 'DLC'))
         self.folder(f, 'dlc_dir', _('Pasta de DLC', 'DLC folder'), _('Pasta com as DLCs do jogo', "Folder with the game's DLC"),
                     _('Como no shadPS4: uma pasta com uma subpasta por DLC (cada uma com sce_sys/param.sfo), ou a '
-                      'pasta addcont do shadPS4 (que tem a subpasta CUSA08809). Vazio = sem DLC.',
+                      'pasta addcont do shadPS4 (que tem a subpasta CUSA08809 ou CUSA08034). Só valem as DLCs da '
+                      'região do jogo. Vazio = sem DLC.',
                       "As in shadPS4: a folder with one subfolder per DLC (each with sce_sys/param.sfo), or "
-                      "shadPS4's addcont folder (which holds the CUSA08809 subfolder). Empty = no DLC."),
+                      "shadPS4's addcont folder (which holds the CUSA08809 or CUSA08034 subfolder). Only DLC of the "
+                      "game's region counts. Empty = no DLC."),
                     on_change=self.refresh_status)
         self.section(f, _('Saves', 'Saves'))
         self.folder(f, 'user_dir', _('Pasta de dados', 'Data folder'), _('Pasta dos saves', 'Saves folder'),
@@ -1097,17 +1236,22 @@ class Launcher:
         holder = ttk.Frame(f)
         holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
         ttk.Button(holder, text=_('Importar save do shadPS4…', 'Import a shadPS4 save…'), command=self.import_save).pack(side='left')
-        ttk.Label(holder, text=_('Copia a pasta savedata/CUSA08809 do shadPS4 para cá.',
-                                 'Copies shadPS4\'s savedata/CUSA08809 folder here.'), style='Muted.TLabel').pack(side='left', padx=10)
+        ttk.Label(holder, text=_('Copia a pasta savedata/CUSA08809 (ou CUSA08034) do shadPS4 para cá.',
+                                 'Copies shadPS4\'s savedata/CUSA08809 (or CUSA08034) folder here.'),
+                  style='Muted.TLabel').pack(side='left', padx=10)
         self.section(f, _('Sistema', 'System'))
         self.row(f, _('Idioma do sistema', 'System language'), self.choice(f, 'language', LANGUAGES),
                  _('O idioma que o jogo vê no "console".', 'The language the game sees on the "console".'))
         self.row(f, _('Nome do jogador', 'Player name'), ttk.Entry(f, textvariable=self.var('player_name'), width=30))
+        self.check(f, 'skip_logos', _('Pular os logotipos de abertura', 'Skip the opening logos'),
+                   _('O jogo abre direto no menu, sem os logotipos de abertura e o aviso de salvamento automático.',
+                     'The game opens straight to the menu, without the opening logos and the autosave notice.'))
 
     def build_graphics(self):
         f = self.scrolled_page('graphics', _('Imagem e FPS', 'Display & FPS'),
-                               _('Os modos vêm do fork shadPS4 SotC e valem para a versão EU 1.01.',
-                                 'The modes come from the shadPS4 SotC fork and apply to EU version 1.01.'))
+                               _('Os modos vêm do fork shadPS4 SotC e valem para as versões EU 1.01 e US 1.00.',
+                                 'The modes come from the shadPS4 SotC fork and apply to EU version 1.01 and US '
+                                 'version 1.00.'))
         self.section(f, _('Modos', 'Modes'), top=4)
         self.check(f, 'af16', _('Texturas nítidas (filtro anisotrópico 16x)', 'Sharp textures (16x anisotropic filtering)'),
                    _('Chão, grama e rochas ficam nítidos à distância, quase sem custo.',
@@ -1428,11 +1572,11 @@ class Launcher:
         info = game_info(self.var('game_dir').get())
         if not info:
             game = _('✗ Não há eboot.bin na pasta do jogo (Jogo e saves)', '✗ No eboot.bin in the game folder (Game & saves)')
-        elif info == (GAME_ID, GAME_VERSION):
+        elif game_supported(self.var('game_dir').get()):
             game = _('✓ {} versão {}: todos os modos disponíveis', '✓ {} version {}: every mode available').format(*info)
         else:
-            game = _('⚠ {} versão {}: o port foi feito para {} {}; os modos não se aplicam',
-                     '⚠ {} version {}: the port targets {} {}; the modes do not apply').format(*info, GAME_ID, GAME_VERSION)
+            game = _('⚠ {} versão {}: o port foi feito para {}; os modos não se aplicam',
+                     '⚠ {} version {}: the port targets {}; the modes do not apply').format(*info, supported_games())
         modules = Path(self.var('sys_modules').get() or '.')
         if self.var('sys_modules').get() and all((modules / m).is_file() for m in SYS_MODULES):
             sound = _('✓ Módulos de som encontrados', '✓ Sound modules found')
@@ -1440,11 +1584,12 @@ class Launcher:
             sound = _('⚠ Sem os módulos de som do seu console: o jogo fica mudo (Jogo e saves)',
                       '⚠ No sound modules from your console: the game is silent (Game & saves)')
         user = user_dir({'user_dir': self.var('user_dir').get()})
-        saves = user / 'savedata' / '1' / GAME_ID
+        serial = game_serial(self.var('game_dir').get())
+        saves = user / 'savedata' / '1' / serial
         save = (_('✓ Saves em {}', '✓ Saves in {}').format(saves) if saves.is_dir() and any(saves.iterdir())
                 else _('• Ainda sem saves: o jogo cria em {}', '• No saves yet: the game creates them in {}').format(saves))
         from sotc_discovery import dlc_count
-        count = dlc_count(self.var('dlc_dir').get())
+        count = dlc_count(self.var('dlc_dir').get(), serial)
         dlc = (_('✓ DLC: {} instalada(s)', '✓ DLC: {} installed').format(count) if count
                else _('• Sem DLC', '• No DLC'))
         for key, text in (('game', game), ('dlc', dlc), ('sound', sound), ('saves', save), ('gpu', self.gpu_text)):
@@ -1517,16 +1662,19 @@ class Launcher:
             LEGACY_CONFIG_FILE.write_text(text, encoding='utf-8')
 
     def import_save(self):
-        found = shadps4_saves()
+        serial = game_serial(self.var('game_dir').get())
+        found = shadps4_saves(serial)
         initial = str(found[0]) if found else str(PORT_DIR.parent)
-        chosen = self.filedialog.askdirectory(title=_('Pasta savedata/CUSA08809 do shadPS4', "shadPS4's savedata/CUSA08809 folder"),
+        chosen = self.filedialog.askdirectory(title=_('Pasta savedata/{} do shadPS4', "shadPS4's savedata/{} folder").format(serial),
                                               initialdir=initial)
         if not chosen:
             return
         source = Path(chosen)
-        if source.name != GAME_ID and (source / GAME_ID).is_dir():
-            source = source / GAME_ID
-        target = user_dir({'user_dir': self.var('user_dir').get()}) / 'savedata' / '1' / GAME_ID
+        # A savedata folder: its subfolder of this game, else of the other release (EU and US
+        # saves are of the same game build). The save goes to this game's folder.
+        if source.name not in GAMES:
+            source = next((source / s for s in (serial, *GAMES) if (source / s).is_dir()), source)
+        target = user_dir({'user_dir': self.var('user_dir').get()}) / 'savedata' / '1' / serial
         # sotc: one save folder picked (it holds sce_sys/param.sfo): import it as one save. The
         # runtime creates the port's metadata for saves that come without it.
         single = (source / 'sce_sys' / 'param.sfo').is_file()
@@ -1585,10 +1733,10 @@ class Launcher:
         self.setup_button = ttk.Button(inner, text=_('Escolher a pasta do jogo…', 'Choose the game folder…'),
                                        style='Play.TButton', command=self.choose_game_for_setup)
         self.setup_button.pack(ipadx=18)
-        tk.Label(inner, text=_('A pasta principal do jogo, como no shadPS4: as subpastas do jogo (CUSA08809), da '
-                               'atualização (-UPDATE/-patch) e das DLCs são encontradas sozinhas.',
-                               "The game's main folder, as in shadPS4: the game (CUSA08809), update (-UPDATE/-patch) "
-                               'and DLC subfolders are found on their own.'),
+        tk.Label(inner, text=_('A pasta principal do jogo, como no shadPS4: as subpastas do jogo (CUSA08809 ou '
+                               'CUSA08034), da atualização (-UPDATE/-patch) e das DLCs são encontradas sozinhas.',
+                               "The game's main folder, as in shadPS4: the game (CUSA08809 or CUSA08034), update "
+                               '(-UPDATE/-patch) and DLC subfolders are found on their own.'),
                  bg=BG, fg=MUTED, font=(ui_font(), 10), wraplength=self.px(560), justify='center').pack(pady=(10, 0))
         self.setup_hint = tk.Label(inner, text='', bg=BG, fg=MUTED, font=(ui_font(), 10), cursor='hand2',
                                    wraplength=self.px(640), justify='center')
@@ -1630,8 +1778,9 @@ class Launcher:
         game = find_game_in(chosen)
         if not game:
             self.messagebox.showerror('Shadow of the Colossus', _(
-                'Não achei o jogo (eboot.bin do CUSA08809) em\n{}\n\nEscolha a pasta do seu dump.',
-                'The game (eboot.bin of CUSA08809) is not in\n{}\n\nChoose the folder of your dump.').format(chosen))
+                'Não achei o jogo (eboot.bin do CUSA08809 ou CUSA08034) em\n{}\n\nEscolha a pasta do seu dump.',
+                'The game (eboot.bin of CUSA08809 or CUSA08034) is not in\n{}\n\nChoose the folder of your dump.')
+                .format(chosen))
             return
         self.configure_from_game(game, chosen)
 
@@ -1646,10 +1795,11 @@ class Launcher:
             from sotc_discovery import find_dlc_root, find_update, dlc_count, scan, SYS_MODULES as modules
             result = {'game': game, 'dlc': find_dlc_root(game, chosen), 'update': find_update(game), 'sound': None,
                       'save': None}
-            result['dlc_count'] = dlc_count(result['dlc'])
+            serial = game_serial(game)
+            result['dlc_count'] = dlc_count(result['dlc'], serial)
             sound_ready = self.app.get('sys_modules') and all(
                 (Path(self.app['sys_modules']) / m).is_file() for m in modules)
-            saves = user / 'savedata' / '1' / GAME_ID
+            saves = user / 'savedata' / '1' / serial
             has_saves = saves.is_dir() and any(saves.iterdir())
             found = {'sys_modules': [], 'saves': []}
             if not sound_ready or not has_saves:
@@ -1670,7 +1820,8 @@ class Launcher:
                     pass
             if not has_saves:
                 own = user.resolve()
-                outside = [p for p in found['saves'] if not Path(p).resolve().is_relative_to(own)]
+                outside = [p for p in found['saves']
+                           if Path(p).name == serial and not Path(p).resolve().is_relative_to(own)]
                 if outside:
                     try:
                         saves.parent.mkdir(parents=True, exist_ok=True)
@@ -1813,7 +1964,7 @@ class Launcher:
         return bool(folder) and all((Path(folder) / m).is_file() for m in SYS_MODULES)
 
     def saves_folder(self):
-        return user_dir({'user_dir': self.var('user_dir').get()}) / 'savedata' / '1' / GAME_ID
+        return user_dir({'user_dir': self.var('user_dir').get()}) / 'savedata' / '1' / game_serial(self.var('game_dir').get())
 
     def has_saves(self):
         saves = self.saves_folder()
@@ -1846,8 +1997,7 @@ class Launcher:
             if parent not in folders:
                 folders.append(parent)
         if found['games'] and not game_info(self.var('game_dir').get()):
-            best = min(found['games'],
-                       key=lambda g: eboot_version(Path(g['path']) / 'eboot.bin') != GAME_VERSION)
+            best = min(found['games'], key=lambda g: not game_supported(g['path']))
             self.var('game_dir').set(best['path'])
             done.append(_('jogo em {}', 'game in {}').format(best['path']))
         if not self.sound_ready() and found['sys_modules']:
@@ -1861,12 +2011,15 @@ class Launcher:
                 done.append(_('som (de {})', 'sound (from {})').format(found['sys_modules'][0]))
             except OSError:
                 pass
-        if not self.var('dlc_dir').get() and found.get('dlc'):
-            self.var('dlc_dir').set(found['dlc'][0])
-            done.append(_('DLC em {}', 'DLC in {}').format(found['dlc'][0]))
+        serial = game_serial(self.var('game_dir').get())
+        dlc = next((path for path, dlc_serial in found.get('dlc', []) if dlc_serial == serial), None)
+        if not self.var('dlc_dir').get() and dlc:
+            self.var('dlc_dir').set(dlc)
+            done.append(_('DLC em {}', 'DLC in {}').format(dlc))
         if not self.has_saves():
             own = user_dir({'user_dir': self.var('user_dir').get()}).resolve()
-            outside = [p for p in found['saves'] if not Path(p).resolve().is_relative_to(own)]
+            outside = [p for p in found['saves']
+                       if Path(p).name == serial and not Path(p).resolve().is_relative_to(own)]
             if outside and self.messagebox.askyesno('Shadow of the Colossus', _(
                     'Encontrei um save do jogo em\n{}\nImportar para o port?',
                     'Found a save of the game in\n{}\nImport it into the port?').format(outside[0])):
@@ -1900,9 +2053,14 @@ class Launcher:
             return
         self.collect()
         if not game_info(self.app['game_dir']):
-            self.messagebox.showerror('Shadow of the Colossus', _('Escolha a pasta do jogo com eboot.bin (CUSA08809).',
-                                                                  'Choose the game folder with eboot.bin (CUSA08809).'))
+            self.messagebox.showerror('Shadow of the Colossus', _('Escolha a pasta do jogo com eboot.bin (CUSA08809 ou CUSA08034).',
+                                                                  'Choose the game folder with eboot.bin (CUSA08809 or CUSA08034).'))
             self.show('game')
+            return
+        free = free_commit_gb()
+        if free is not None and free < MIN_FREE_COMMIT_GB and not self.messagebox.askyesno(
+                'Shadow of the Colossus', _('O Windows só tem {:.1f} GB livres para programas (RAM + arquivo de paginação). O jogo reserva cerca de 6 GB ao abrir e precisa de mais alguns GB depois; com menos, ele fecha logo no início (erro 1455 no log).\n\nPara resolver: Iniciar → "Ajustar a aparência e o desempenho do Windows" → Avançado → Memória virtual → Alterar… → marque "Gerenciar automaticamente o tamanho do arquivo de paginação" (ou defina pelo menos 16 GB) e reinicie o PC. Fechar navegadores e outros programas grandes também ajuda.\n\nAbrir o jogo mesmo assim?',
+                                            'Windows has only {:.1f} GB free for programs (RAM + page file). The game reserves about 6 GB when it starts and needs a few GB more after that; with less it closes right at the start (error 1455 in the log).\n\nTo fix it: Start → "Adjust the appearance and performance of Windows" → Advanced → Virtual memory → Change… → tick "Automatically manage paging file size for all drives" (or set at least 16 GB) and restart the PC. Closing browsers and other big programs also helps.\n\nStart the game anyway?').format(free)):
             return
         self.set_log('')
         try:
@@ -1911,7 +2069,9 @@ class Launcher:
             self.append(_('Não foi possível gravar as teclas no sotc.ini: {}',
                           'Could not write the keys to sotc.ini: {}').format(error) + '\n')
         try:
-            self.process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=game_environment(self.app),
+            env = game_environment(self.app)
+            env['SOTC_EVENT_LOG'] = start_event_log(user_dir(self.app), self.app, env)
+            self.process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=env,
                                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                             stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
         except OSError as error:
@@ -1951,11 +2111,12 @@ class Launcher:
                 pass
             if not self.stopping:
                 keep_crash_log(log_dir, code)
+            end_event_log(log_dir, code, self.stopping)
         self.stopping = False
         self.output.put((code,))
 
     # Quick settings the in-game menu may have changed (it writes them to the settings file).
-    LIVE_KEYS = ('fps_mode', 'framegen', 'hq_textures', 'shadow_reuse', 'volume')
+    LIVE_KEYS = ('fps_mode', 'framegen', 'textures', 'shadow_reuse', 'volume', 'upscaler', 'sharpness')
 
     def reload_live_settings(self):
         saved = load_json(CONFIG_FILE, {})
@@ -2162,6 +2323,29 @@ class GameJob:
             self.handle = None
 
 
+def free_commit_gb():
+    """Commit memory Windows can still give programs (RAM + page file), in GB; None if unknown."""
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [('length', ctypes.c_uint32), ('load', ctypes.c_uint32),
+                    ('total_phys', ctypes.c_uint64), ('avail_phys', ctypes.c_uint64),
+                    ('total_commit', ctypes.c_uint64), ('avail_commit', ctypes.c_uint64),
+                    ('total_virtual', ctypes.c_uint64), ('avail_virtual', ctypes.c_uint64),
+                    ('avail_extended', ctypes.c_uint64)]
+    status = MemoryStatus()
+    status.length = ctypes.sizeof(status)
+    try:
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+    except (AttributeError, OSError):
+        return None
+    return status.avail_commit / 1e9
+
+
+# The guest memory pool (~6 GB, committed at once when the game starts) plus the process itself:
+# below this the game stops at boot with error 1455 (issue #95).
+MIN_FREE_COMMIT_GB = 8.0
+
+
 def play_without_window(settings):
     """--play: the game with the saved settings (shortcuts, Steam); output to user/last_run.log."""
     attach_stdio()
@@ -2171,8 +2355,10 @@ def play_without_window(settings):
         write_key_bindings(settings.get('keys'))
     except OSError:
         pass
+    env = game_environment(settings)
+    env['SOTC_EVENT_LOG'] = start_event_log(log_dir, settings, env)
     with open_session_log(log_dir) as log:
-        process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=game_environment(settings),
+        process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
         for raw in iter(process.stdout.readline, b''):
@@ -2185,6 +2371,7 @@ def play_without_window(settings):
         code = process.wait()
         log.write(f'[exit code {code} = {code & 0xffffffff:#x}]\n')
     keep_crash_log(log_dir, code)
+    end_event_log(log_dir, code)
     return code
 
 

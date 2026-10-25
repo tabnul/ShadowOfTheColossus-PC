@@ -8,7 +8,7 @@ Restores out/save-template (unless --keep-save), starts out/bb-probe.exe and pla
 
 An event is seconds:what[:hold_ms]. "what" is pad tokens joined by ',' (BB_PAD_FILE names of
 src/runtime_pad.c: cross, circle, options, up, lx=0..255, ...), "shot" (dump the presented frame
-to out/dump, converted to PNG at the end), "stacks" (thread stacks to the log) or "log:text" (a marker in the output). Times count
+to out/dump, converted to PNG at the end), "menu" (opens or closes the in-game menu), "tex=off|high|max", "fps=30|60|unlimited", "up=fsr1|bilinear", "rcas=high|medium|low|off" (quick settings, as the in-game menu sets them), "stacks" (thread stacks to the log) or "log:text" (a marker in the output). Times count
 from the "Starting main loop" line when --from-main-loop is given, else from the start.
 """
 import argparse
@@ -21,6 +21,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'scripts'))
+from sotc_modes import game_serial, save_template  # noqa: E402
 GAME = os.environ.get('SOTC_GAME_DIR', str(Path(__file__).resolve().parents[2] / 'CUSA08809'))
 
 
@@ -38,15 +40,18 @@ def main():
     args = parser.parse_intermixed_args()  # events may follow options (the bench scripts' --env)
     os.chdir(ROOT)
     out = Path('out')
-    template = out / 'save-template' / 'CUSA08809'
+    serial = game_serial(GAME)  # CUSA08809 (EU) or CUSA08034 (US): the folder the game saves in
+    template = save_template(out / 'save-template', serial)
     if args.fresh:
         shutil.rmtree(out / 'user' / 'savedata', ignore_errors=True)
-    elif template.is_dir() and not args.keep_save:
-        target = out / 'user' / 'savedata' / '1' / 'CUSA08809'
+    elif template and not args.keep_save:
+        target = out / 'user' / 'savedata' / '1' / serial
         shutil.rmtree(target, ignore_errors=True)
         shutil.copytree(template, target)
     shutil.rmtree(out / 'dump', ignore_errors=True)
     (out / 'dump').mkdir(parents=True)
+    for stale in ('set.trigger', 'menu.trigger', 'dump.trigger'):  # left by a run that ended first
+        (out / stale).unlink(missing_ok=True)
     pad = out / 'pad.txt'
     pad.write_text('')
     env = dict(os.environ)
@@ -54,7 +59,9 @@ def main():
                                                 r'C:\msys64')
     env['PATH'] = str(Path(msys) / 'clang64' / 'bin') + os.pathsep + env['PATH']
     env.update(BB_FRAME_DUMP_TRIGGER=str(out / 'dump.trigger'), BB_DUMP_DIR=str(out / 'dump'), BB_PAD_FILE=str(pad),
-               BB_STACKS_TRIGGER=str(out / 'stacks.trigger'), SOTC_SAVE_PROMPT='auto')
+               BB_STACKS_TRIGGER=str(out / 'stacks.trigger'), SOTC_MENU_TRIGGER=str(out / 'menu.trigger'),
+               SOTC_SET_TRIGGER=str(out / 'set.trigger'),
+               SOTC_SAVE_PROMPT='auto')
     for item in args.env:
         name, value = item.split('=', 1)
         env[name] = value
@@ -95,6 +102,10 @@ def main():
                 (out / 'dump.trigger').touch()
             elif what == 'rdoc':
                 (out / 'rdoc.trigger').touch()
+            elif what.split('=')[0] in ('tex', 'fps', 'up', 'rcas'):
+                (out / 'set.trigger').write_text(what)
+            elif what == 'menu':
+                (out / 'menu.trigger').touch()
             elif what == 'stacks':
                 (out / 'stacks.trigger').touch()
             elif what == 'log':

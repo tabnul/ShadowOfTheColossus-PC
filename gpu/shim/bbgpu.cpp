@@ -143,7 +143,7 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now().time_since_epoch())
                     .count());
-            BbMemReport::WsDiagCopy(backing, dest, n);
+            BbMemReport::WsDiagCopy(backing, reinterpret_cast<const void*>(source), dest, n);
             std::memcpy(dest, backing, n);
             BbMemReport::WsDiagCopyDone(before, n);
         } else if (backing) std::memcpy(dest, backing, n);
@@ -244,6 +244,17 @@ u64 PS4_SYSV_ABI sceKernelGetProcessTime() { return runtime_process_time_us(); }
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounter() { return runtime_process_time_counter(); }
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounterFrequency() { return 1'000'000'000; }
 extern "C" int runtime_sotc_neo(void);
+extern "C" int bbgpu_warmup_finished(void) {
+    return SotcStats::warmup_finished.load(std::memory_order_relaxed) ? 1 : 0;
+}
+
+extern "C" void bbgpu_request_texture_flush(void) {
+    SotcStats::load_flush.store(true, std::memory_order_relaxed);
+}
+
+extern "C" uint64_t bbgpu_flip_count(void) {
+    return SotcStats::flip_count.load(std::memory_order_relaxed);
+}
 s32 PS4_SYSV_ABI sceKernelIsNeoMode() { return runtime_sotc_neo(); } // sotc: SOTC_NEO=1, a PS4 Pro
 s32 PS4_SYSV_ABI sceKernelGetCompiledSdkVersion(s32* ver) {
     if (!ver) return ORBIS_KERNEL_ERROR_EINVAL;

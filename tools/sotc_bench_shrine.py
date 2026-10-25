@@ -21,6 +21,8 @@ Open-world routes recorded by a player (src/runtime_pad.c BB_PAD_RECORD / BB_PAD
                              close.
     --replay out/route.txt   gets to the idle scene, plays the recording back and measures the
                              whole replay (frames dumped every 15 s).
+    --turn SECONDS           at the idle scene, holds --turn-pad (default rx=255, the right
+                             stick) for SECONDS, then measures (e.g. Mono on the altar out of view).
 """
 import argparse
 import os
@@ -33,6 +35,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'scripts'))
+from sotc_modes import game_serial, save_template  # noqa: E402
 GAME = os.environ.get('SOTC_GAME_DIR', str(Path(__file__).resolve().parents[2] / 'CUSA08809'))
 IDLE_LOW, IDLE_HIGH, IDLE_SPREAD, IDLE_SAMPLES = 5500, 6400, 300, 3
 FPS_LINE = re.compile(r'SOTC FPS ([\d.]+) at (\d+)s; (\d+) cmds/frame')
@@ -47,9 +51,13 @@ def main():
     parser.add_argument('--patches', default='out/bench.patches')
     parser.add_argument('--cmdline', default='out/bench.cmdline')
     parser.add_argument('--shots', type=int, default=3, help='frames dumped during the measurement')
-    parser.add_argument('--template', default='out/save-template', help='save folder holding CUSA08809/')
+    parser.add_argument('--template', default='out/save-template', help='save folder holding CUSA08809/ or CUSA08034/')
     parser.add_argument('--record', help='hand over to the player with BB_PAD_RECORD=<file> (F9 stops)')
     parser.add_argument('--replay', help='measure a replay of a BB_PAD_RECORD file')
+    parser.add_argument('--turn', type=float, default=0,
+                        help='at the idle scene, turn the camera (right stick) for this many seconds, then measure')
+    parser.add_argument('--turn-pad', default='rx=255',
+                        help='pad file tokens held during --turn (default rx=255: camera right; e.g. "ly=255" walks)')
     parser.add_argument('--assist', default='auto',
                         help='during a replay, also tap BUTTON every 0.4 s between START and END seconds '
                              '(START:END:BUTTON; "" for none). Agro, an AI character, does not stop at '
@@ -74,11 +82,12 @@ def main():
         args.timeout = max(args.timeout, 3600)
     os.chdir(ROOT)
     out = Path('out')
-    template = Path(args.template) / 'CUSA08809'
-    if not template.is_dir():
-        print(f'INVALID: need {template}')
+    serial = game_serial(GAME)  # CUSA08809 (EU) or CUSA08034 (US): the folder the game saves in
+    template = save_template(args.template, serial)
+    if not template:
+        print(f'INVALID: need {Path(args.template) / serial}')
         return 1
-    target = out / 'user' / 'savedata' / '1' / 'CUSA08809'
+    target = out / 'user' / 'savedata' / '1' / serial
     shutil.rmtree(target, ignore_errors=True)
     shutil.copytree(template, target)
     shutil.rmtree(out / 'dump', ignore_errors=True)
@@ -192,6 +201,18 @@ def main():
                       flush=True)
             time.sleep(0.5)
             continue
+        if idle_at is not None and args.turn and not state.get('turned'):
+            # Turn first; the measured window and the shots start once the stick is released.
+            now = time.monotonic() - start
+            if 'turn_end' not in state:
+                pad.write_text(args.turn_pad)
+                state['turn_end'] = now + args.turn
+            if now < state['turn_end']:
+                time.sleep(0.05)
+                continue
+            pad.write_text('')
+            state['turned'] = True
+            state['idle_at'] = idle_at = now
         if idle_at is not None and args.replay and not state.get('replaying'):
             state['replaying'] = True
             state['replay_at'] = time.monotonic() - start
@@ -267,7 +288,7 @@ def main():
     fps = [s[0] for s in window]
     cmds = sum(s[1] for s in window) / len(window)
     # The idle scene seen in every good run draws ~5900 commands per frame.
-    tag = '' if args.replay or IDLE_LOW <= cmds <= IDLE_HIGH else 'INVALID (unexpected scene): '
+    tag = '' if args.replay or args.turn or IDLE_LOW <= cmds <= IDLE_HIGH else 'INVALID (unexpected scene): '
     print(f'{tag}avg {sum(fps) / len(fps):.1f} FPS, min {min(fps):.1f} '
           f'({len(fps)} samples over {args.measure:.0f} s after idle at {idle_at:.0f} s, {cmds:.0f} cmds/frame)')
     return 0 if not tag else 1

@@ -1,6 +1,7 @@
 # Shadow of the Colossus — PC (port nativo)
 
-Port nativo do **Shadow of the Colossus** de PS4 (CUSA08809, versão EU 1.01) para Windows.
+Port nativo do **Shadow of the Colossus** de PS4 (CUSA08809, versão EU 1.01, ou CUSA08034,
+versão US 1.00) para Windows.
 O código do jogo roda direto na CPU. Isto não é um emulador completo: há um carregador e as
 funções de sistema de que o jogo precisa. A GPU usa o núcleo de vídeo Vulkan do fork
 shadPS4 SotC. A base é o [bloodborne_pc](https://github.com/Supermedo/bloodborne_pc) (GPL-2.0).
@@ -12,7 +13,7 @@ Este pacote **não contém o jogo nem firmware da Sony**. Você precisa ter os s
 - Windows 10/11 64-bit e GPU com Vulkan 1.3.
 - Python não é necessário para o `SotC.exe`; só o `SotC.bat` precisa de
   [Python 3](https://www.python.org/downloads/).
-- O **seu dump** do jogo CUSA08809 (pasta com `eboot.bin`, `sce_module`, `sce_sys`...).
+- O **seu dump** do jogo CUSA08809 ou CUSA08034 (pasta com `eboot.bin`, `sce_module`, `sce_sys`...).
 - Para ter som, `libSceNgs2.sprx` e `libSceUlt.sprx` do **seu próprio console**, decriptados.
   São os mesmos arquivos da pasta `user/sys_modules` do shadPS4; num PS4 com GoldHEN ficam em
   `/system/common/lib/` (FTP na porta 2121). Sem eles o jogo funciona, mas sem som.
@@ -21,7 +22,7 @@ Este pacote **não contém o jogo nem firmware da Sony**. Você precisa ter os s
 
 1. Abra `SotC.exe`, o lançador.
 2. Na primeira vez ele **procura sozinho** nos discos do PC:
-   - a pasta do jogo (CUSA08809);
+   - a pasta do jogo (CUSA08809 ou CUSA08034);
    - os dois `.sprx` de som de um shadPS4 instalado (pasta `user/sys_modules`), que ele copia
      para a pasta de dados do port;
    - um save do jogo no shadPS4, que ele oferece importar;
@@ -47,6 +48,10 @@ Tudo isto está no lançador, na página **Imagem e FPS** (e os principais em **
   da tela; a tela cheia usa o monitor inteiro.
 - **60 FPS** (experimental): tira o limite de 30 FPS do jogo (patch GoldHEN de illusion), com
   vblank a 120 Hz. Mediu 38 FPS no campo aberto e ~25 no templo.
+- **Reutilização de binds** (ligada por padrão; `SOTC_FAST_BIND=0` desliga): pula
+  a remontagem dos descritores quando o desenho seguinte usa o mesmo pipeline, recursos e
+  uniforms. Medido no Santuário: ~25 → 30 FPS. Na 0.60.5 deixava pontos pretos em grade no chão de
+  areia; com a correção o chão de areia do demo ficou limpo.
 - **Texturas nítidas**: filtro anisotrópico 16x, quase sem custo.
 - **HDR**: saída HDR10 com a renderização HDR do próprio jogo; o HDR do Windows precisa estar
   ligado. O branco fica em 200 nits (`SOTC_HDR_WHITE` muda). Funciona com FSR 1 e DLSS.
@@ -58,7 +63,9 @@ Tudo isto está no lançador, na página **Imagem e FPS** (e os principais em **
 - **Cvars do motor** (Avançado): variáveis do motor Bluepoint, `NOME=valor`, para quem quer
   experimentar.
 
-Os modos de patch só valem para a versão EU 1.01; em outra versão eles não são aplicados.
+Os modos de patch valem para a versão EU 1.01 e para a US 1.00 (o executável é o mesmo); em
+outra versão eles não são aplicados. Cada versão tem os seus saves (`user/savedata/1/CUSA08809`
+ou `CUSA08034`) e só usa DLCs da mesma região.
 
 ## Controles
 
@@ -135,6 +142,7 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `BB_FAULT_RING=arquivo` | grava as últimas exceções (sobrevive a quedas) |
 | `BB_STACKS_TRIGGER=arquivo` | criar o arquivo despeja as pilhas das threads |
 | `BB_READBACKS=0/1/2` | leituras da GPU; o padrão 2 é o exigido pelo jogo |
+| `SOTC_FAST_BIND=0` | desliga o reaproveitamento de binds de descritores entre desenhos iguais (padrão: ligado) |
 | `SOTC_RECORD_THREAD=0` | grava os comandos Vulkan na própria thread de comandos (padrão: thread própria) |
 | `SOTC_INDIRECT_DIRECT=0` | mantém indiretos os draws cujos argumentos estão na CPU |
 | `SOTC_WAIT_MARKER=1/2` | esperas pela GPU consultam um marcador escrito por ela (experimental) |
@@ -143,6 +151,7 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_HEAP_TRACK=arquivo` | só em builds com `-DBB_HEAP_TRACK=ON`: a cada minuto grava as pilhas de chamada que mais seguram memória do heap (vazamentos); `tools/heap_track_report.py` compara dois relatórios |
 | `SOTC_WS_DIAG=1` | linha `SOTC WS` a cada 5 s: quanto as cópias de buffers da GPU copiaram, quantas páginas de origem/staging estavam fora do working set (falhas de página), falhas de página do processo, heap de memória do host do Vulkan e memória zerada ao liberar |
 | `SOTC_AMD_WAVE32=1` | só AMD, para testar nas GCN (RX 470-590, Vega, integradas): os shaders são convertidos para 32 lanes, como faz a camada SotC-AMD-Fix (personagens piscando em branco). O cache de shaders é refeito; o log mostra `GPU: AMD wave32 on`. De Lucas-blip-png |
+| `SOTC_SLOW_BUILD_MS=500` | o log mostra `SOTC SLOW BUILD` para cada pipeline construído em segundo plano (ou esperado pela gravação de comandos) que levou esse tempo ou mais; `SOTC SYNC PIPELINE` mostra os construídos na thread de comandos acima de 30 ms (`SOTC_SYNC_PIPELINE_MS`). Para as travadas longas nas placas Intel Arc |
 | `SOTC_HDR_WHITE=nits` | com HDR: o branco do jogo em nits (padrão 200; a saída do próprio jogo tem ~100) |
 | `SOTC_EVICT_ASYNC=0` | a devolução de memória fria das arenas espera a GPU no processador de comandos, como antes (~44 ms por vez) |
 | `SOTC_UI_HIRES=0` | com DLSS, a interface (textos, logos, HUD) volta a ser desenhada na resolução de renderização e ampliada, em vez de na resolução de saída |

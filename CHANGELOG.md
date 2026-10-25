@@ -1,5 +1,104 @@
 # Changelog
 
+## 0.60.6-opt11 — 2026-10-24 (fork do Oussama268)
+- **+25% de FPS no Santuário e quadros mais estáveis:** as leituras antecipadas da GPU
+  ("hot readbacks", da fusão de 8/10) voltam ligadas por padrão (`SOTC_RB_HOT=1`; `=0` desliga).
+  Antes de escrever, cada página é conferida sob a trava da sua região: se o jogo já escreveu
+  nela, a cópia é pulada. Era a corrida que deixava o arco-íris nas texturas na 0.60.5.
+  Santuário 34,6 → 43,3 FPS, demonstração da tela título 54 → 60,7.
+- Descritores reaproveitados ligados por padrão (`SOTC_FAST_BIND`, `=0` desliga).
+- Correções do tabnul: grama, HDR, menu do DLSS, pular os logos (#91, #92, #94, #96).
+- Lançador: aviso de pouca memória (#95).
+- Do upstream #258 (JihedMrouki): o cache de shaders confere se o arquivo existe, dica de
+  trabalho na fila do Liverpool, posição invariante nos shaders de vértice (GTX 10xx).
+  **O cache de shaders é refeito na primeira abertura.**
+- Diagnóstico: `SOTC_PROFILE_SLOW_MS=<ms>` só guarda amostras dos quadros mais longos que isso.
+- A travada ao cavalgar continua: nos quadros lentos as threads do jogo esperam umas pelas
+  outras (mutex e event flags do próprio jogo) e há cópias de ~200 MB nas trocas de cena.
+
+### Versão americana (CUSA08034)
+- **O dump americano CUSA08034 (1.00, a única versão americana) funciona.** O executável é o
+  mesmo da versão europeia 1.01 (código e dados idênticos byte a byte; os arquivos `.psarc`
+  também), então todas as correções, os modos de patch (60 FPS, filtro 16x, tamanho de
+  renderização) e a proteção da red zone valem para os dois. Só os logos e telas legais mudam
+  (o jogo escolhe a região pelo `gameversion.txt`). Testado até o segundo colosso.
+- As correções da GPU antes restritas ao CUSA08809 (barreiras LDS, wave64, tabelas de T#,
+  testes de profundidade antecipados dos decalques, flush periódico) agora valem para os dois
+  seriais (`IsSotc()`). Sem os testes antecipados, os decalques atrás de um objeto pintavam a
+  caixa inteira por cima dele (bordas e texturas do fundo na frente). O log mostra
+  `SOTC early fragment tests: on`.
+- **Saves separados por versão** (`user/savedata/1/CUSA08034`) e cache de shaders próprio
+  (`user/cache/CUSA08034`). **DLCs só da mesma região** (pasta `addcont/CUSA08034`, content ID
+  `UP9000-CUSA08034_00-...`).
+- **Lançador:** acha o dump americano pelo `TITLE_ID` do `param.sfo`, com qualquer nome de pasta
+  (como `CUSA08034-app`), mostra "✓ CUSA08034 versão 01.00: todos os modos disponíveis" e não
+  marca mais o dump como não suportado. Com os dois dumps, o europeu vem primeiro.
+- Ferramentas (`tools/`) e o modelo de save dos benchmarks aceitam os dois seriais. Testes novos
+  (`tests/test_games.py`) falham se algum código voltar a testar um serial só.
+- A versão americana não tem os 3 textos em árabe da atualização europeia 1.01.
+
+## 0.60.6 — 2026-10-22
+- **Fim do ruído arco-íris nas texturas e das quedas "do nada" (`0x49500`).** A causa eram as
+  leituras "quentes" da GPU (`SOTC_RB_HOT`): junto com cada leitura, o port escrevia na memória do
+  jogo, por especulação, regiões lidas antes; depois de carregar um save ou uma área nova o jogo já
+  tinha reaproveitado essa memória para texturas novas e para os seus heaps, e o desenho antigo da
+  GPU caía por cima. Agora vêm desligadas (o FPS médio do demo cai ~4%). Achado com a receita do
+  usuário: área nova → esperar → sair → recarregar o save.
+- **Pontos pretos em grade no chão de areia** (0.60.5): a otimização de binds da PR #232 sai
+  desligada por padrão (`SOTC_FAST_BIND=1` liga; a correção dela aguarda teste).
+- **PR #219 (vazamento de memória) desligada por padrão**: com ela, ruído colorido e polígonos
+  pretos gigantes ("explosão de vértices") apareciam com muito mais frequência
+  (`SOTC_CP_FREE_TASKS=1` liga).
+- **Menu do jogo (F1):** só o que funciona no SotC (as opções de upscaler, preset, resolução e
+  efeitos herdadas do Bloodborne não faziam nada); **FPS (30/60/ilimitado), Upscaler e Nitidez**
+  mudam na hora; textura **Máxima** desativada no modo PS4 Pro (fechava em minutos); dica explica
+  o que vale na hora.
+- **Disco rígido:** depois que o jogo carrega, os arquivos do jogo (13,7 GB) são lidos uma vez em
+  ordem e ficam na RAM: lugares novos não travam mais esperando o HD (`SOTC_PREFETCH=0` desliga).
+- **Carregamentos:** a cada save ou área nova, as texturas sem uso são descartadas
+  (`SOTC_LOAD_FLUSH=0` desliga).
+- **Log de eventos `user/events.log`:** configuração por extenso, sistema (CPU, RAM, HD/SSD), menu,
+  teclas, controle, carregamentos, texturas, desempenho por minuto, erros explicados; idioma do
+  lançador; as 5 últimas sessões e uma cópia em `user/crashes` após uma queda.
+- PRs: #215 (pré-carga de pipelines nos workers: driver novo 106 s → 7 s), #198 (CPUs de 4
+  threads), #205 (barreiras LDS na AMD GCN), #207, #212.
+- Revisão de código: guarda dos heaps do mundo, vigia de travamento, memória em PC com pouca RAM,
+  "Ilimitado" do lançador preservado, tela de carregamento translúcida em engasgos curtos.
+
+## 0.60.5 — 2026-10-21
+- **Seletor de qualidade das texturas: Desligada / Alta / Máxima** (#235), no lançador
+  (Ajustes rápidos → Texturas) e no menu do jogo (muda na hora). **Alta (estável)**, o padrão,
+  mantém a proteção da 0.60.3/0.60.4 (texturas um nível mais grossas quando a memória de texturas
+  do jogo está acabando); como essa memória fica quase sempre cheia nas áreas grandes, a 0.60.4
+  ficava menos nítida que a 0.60.3. **Máxima (nítida)** tira a proteção: sempre o nível mais fino,
+  mas **pode fechar em vistas muito amplas** (espada contra o sol, Santuário, área do último
+  colosso; `0x1a371`, #186), principalmente no modo PS4 Pro; se acontecer, volte para Alta.
+  **Desligada** = só as versões 256×256 do jogo. A antiga caixa "Texturas em alta qualidade" vira
+  Alta (ou Desligada).
+- **Vazamento de memória** (~60 MB por minuto, mais de 7 GB em meia hora; engasgos em sessões
+  longas): cada buffer de comandos aninhado deixava a sua corrotina na memória (PR #219,
+  Oussama268).
+- **Mais FPS:** os descritores do desenho anterior são reaproveitados quando o desenho seguinte usa
+  o mesmo pipeline e os mesmos recursos (PR #232, Tadomikaari312-Hy): demo +3,3% na média, +12% na
+  mínima (72,8 / 37,1 → 75,2 / 41,7). `SOTC_FAST_BIND=0` desliga.
+- **Carregamento depois de atualizar o driver da placa: 106 s → 7 s** (os pipelines guardados são
+  montados pelas threads auxiliares; PR #215, Oussama268). `SOTC_ASYNC_PRELOAD=0` volta ao antigo.
+- **AMD GCN** (RX 470–590, Vega, APUs): barreiras de memória compartilhada que essas placas não
+  recebiam, provável correção dos personagens e da fumaça brancos (PR #205, Lucas-blip-png; teste
+  em placas GCN pelos jogadores). `SOTC_AMD64_LDS=0` desliga.
+- **CPUs com 4 threads:** o gravador de comandos e o processador de comandos não ocupam mais um
+  núcleo inteiro esperando (preso no carregamento → 73 FPS; PR #198, Lucas-blip-png).
+- **Lançador:** não para quando o console recusa escrita (#104, PR #207); dump ou módulos ainda
+  criptografados dizem qual arquivo é (PR #212).
+- **Tela de carregamento:** engasgos curtos no jogo só escurecem a imagem; fica opaca depois de 3 s
+  sem quadro (antes piscava preto em travadas de 1 s).
+- **Vigia de travamento:** depois de 15 s sem quadro do jogo, as pilhas das threads vão para o log
+  (`SOTC_WATCHDOG=0` desliga), para achar o "fechou do nada".
+- **Revisão de código:** a proteção dos heaps do mundo pulava a guarda nas peças seguintes do heap
+  e deixava peças novas sem guarda por até 2 s; PCs com pouca RAM recebiam o tamanho da memória
+  antes da redução; o botão 60 FPS do menu trocava "Ilimitado" por "60".
+- Menu do jogo e atalhos (F1, F7, F8, F10, F11) explicados no README, com imagem.
+
 ## 0.60.4 — 2026-10-20
 - **Blocos ciano nas pedras e flores piscando** (com "Texturas em alta qualidade"): o ajuste da
   0.60.3 que evita a queda trocava o nível de detalhe das texturas a cada um ou dois segundos nas

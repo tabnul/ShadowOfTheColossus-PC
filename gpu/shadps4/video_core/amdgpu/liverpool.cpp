@@ -4,6 +4,12 @@
 #include <atomic>
 #include <utility>
 #include <cstdlib>
+#include <deque>
+#include <mutex>
+#include <new>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -478,13 +484,34 @@ void Liverpool::Process(std::stop_token stoken) {
         VideoCore::StartCapture();
 
         curr_qid = -1;
+        // sotc: SOTC_CP_YIELD (default 1). Every YIELD sits in a wait loop (WaitRegMem,
+        // MemSemaphore, Rewind, the CE/DE counters, or a child buffer's wait), so a resumed task
+        // that is not done is waiting. When a whole round over the mapped queues finishes no task
+        // and runs no command, the thread gives up its time slice instead of spinning: with few
+        // cores the spin took a core from the game's threads and the draw thread. With a core to
+        // spare, yield returns at once.
+        static const bool cp_yield = [] {
+            const char* v = std::getenv("SOTC_CP_YIELD");
+            return !v || std::atoi(v) != 0;
+        }();
+        u32 since_progress = 0;
 
         while (num_submits || (num_commands && !back_threaded) || num_ordered) {
+            if (num_commands && !back_threaded) {
+                since_progress = 0;
+            }
             ProcessCommands();
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
+            ++since_progress;
 
             auto& queue = mapped_queues[curr_qid];
+
+            // sotc: skip the lock entirely for a queue that almost certainly has nothing queued
+            // (see GpuQueue::has_work) instead of taking m_access on every queue every pass.
+            if (!queue.has_work.load(std::memory_order_acquire)) {
+                continue;
+            }
 
             Task::Handle task{};
             {
@@ -495,17 +522,27 @@ void Liverpool::Process(std::stop_token stoken) {
                 task = queue.submits.front();
                 cp_submit_seq = queue.submit_seqs.front();
             }
-            const u64 parse_start = SotcStats::NowNs();
+            // sotc: timed only for the SOTC_FPS line (two clock reads per resume of the spin).
+            const u64 parse_start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
             task.resume();
-            SotcStats::cp_parse_ns.fetch_add(SotcStats::NowNs() - parse_start,
-                                             std::memory_order_relaxed);
+            if (SotcStats::kFpsLog) {
+                SotcStats::cp_parse_ns.fetch_add(SotcStats::NowNs() - parse_start,
+                                                 std::memory_order_relaxed);
+            }
 
-            if (task.done()) {
+            if (!task.done()) {
+                if (cp_yield && since_progress >= num_mapped_queues) {
+                    since_progress = 0;
+                    std::this_thread::yield();
+                }
+            } else {
+                since_progress = 0;
                 task.destroy();
 
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
                 queue.submit_seqs.pop();
+                queue.has_work.store(!queue.submits.empty(), std::memory_order_release);
 
                 --num_submits;
                 std::scoped_lock lock2{submit_mutex};
@@ -529,6 +566,80 @@ void Liverpool::Process(std::stop_token stoken) {
         BackOrRun([] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle); },
                   false);
     }
+}
+
+// sotc: the frames of finished nested command buffer tasks (an indirect buffer each: ~700 a
+// second in the compute queues) were never freed, ~60 MB a minute (PR #219). Freed at once, as
+// that PR did, the game showed speckled, rainbow-coloured textures on the Shrine's floor and
+// walls and then crashed in its heap (0x49500), with that change alone on (user, 22 Oct): the
+// draw thread still ran work queued from them. A frame is freed once the draw thread has run
+// everything queued until it finished (back_tail >= the back_head then); the user still saw a
+// huge black polygon over the Shrine with that (vertex garbage, the GTX 1080 streamer's "vertex
+// explosion"): something else keeps using freed memory, and the leak hid it (frames were never
+// reused). Off until that is found, as before #219: SOTC_CP_FREE_TASKS=1 frees them.
+static bool FreeNestedTasks() {
+    static const bool free_tasks = [] {
+        const char* v = std::getenv("SOTC_CP_FREE_TASKS");
+        return v && v[0] == '1';
+    }();
+    return free_tasks;
+}
+
+static bool TaskGuard() {
+    static const bool guard = [] {
+        const char* v = std::getenv("SOTC_TASK_GUARD");
+        const bool on = v && v[0] == '1';
+        if (on) {
+            std::fprintf(stderr, "SOTC TASK GUARD: freed task frames become inaccessible\n");
+        }
+        return on;
+    }();
+    return guard;
+}
+
+void* Liverpool::Task::promise_type::operator new(std::size_t size) {
+#ifdef _WIN32
+    if (TaskGuard()) {
+        void* frame = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!frame) {
+            throw std::bad_alloc{};
+        }
+        return frame;
+    }
+#endif
+    return ::operator new(size);
+}
+
+void Liverpool::Task::promise_type::operator delete(void* frame, std::size_t size) {
+#ifdef _WIN32
+    if (TaskGuard()) {
+        // The pages are decommitted (inaccessible, memory given back) but the address range stays
+        // reserved for good: no later frame, nor anything else, ever gets the same address
+        // (telling a stale read from a cache keyed by a reused address).
+        VirtualFree(frame, size, MEM_DECOMMIT);
+        return;
+    }
+#endif
+    ::operator delete(frame);
+}
+
+void Liverpool::FreeTaskFrame(std::coroutine_handle<> frame) {
+    if (!FreeNestedTasks()) {
+        return;
+    }
+    // SOTC_CP_FREE_NOW=1: at once, as PR #219 did (reproducing its garbage for tests)
+    static const bool free_now = std::getenv("SOTC_CP_FREE_NOW") != nullptr;
+    if (!back_threaded || free_now) {
+        frame.destroy();
+        return;
+    }
+    finished_frames.emplace_back(frame, back_head.load(std::memory_order_acquire));
+    const u64 tail = back_tail.load(std::memory_order_acquire);
+    size_t done = 0;
+    while (done < finished_frames.size() && finished_frames[done].second <= tail) {
+        finished_frames[done++].first.destroy();
+    }
+    finished_frames.erase(finished_frames.begin(), finished_frames.begin() + done);
 }
 
 Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
@@ -586,8 +697,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                 YIELD_CE();
                 RESUME_CE(task);
             }
-            // sotc: the nested task's frame is not freed by Task (it was leaked per IB).
-            task.handle.destroy();
+            // sotc: the nested task's frame is not freed by Task (FreeTaskFrame).
+            FreeTaskFrame(task.handle);
             break;
         }
         default:
@@ -1269,7 +1380,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     RESUME_GFX(task);
                 }
                 // sotc: free the nested task's frame (Task does not; it was leaked per IB).
-                task.handle.destroy();
+                FreeTaskFrame(task.handle);
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -1454,7 +1565,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             }
             // sotc: free the nested task's frame. Task does not, and SotC's compute queues run
             // an indirect buffer per dispatch batch: ~1 KiB leaked hundreds of times a second.
-            task.handle.destroy();
+            FreeTaskFrame(task.handle);
             break;
         }
         case PM4ItOpcode::DmaData: {
@@ -1718,6 +1829,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
         queue.submit_seqs.push(guest_submit_seq.fetch_add(1) + 1);
+        queue.has_work.store(true, std::memory_order_release);
     }
 
     std::scoped_lock lk{submit_mutex};
@@ -1735,6 +1847,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
         queue.submit_seqs.push(guest_submit_seq.fetch_add(1) + 1);
+        queue.has_work.store(true, std::memory_order_release);
     }
 
     std::scoped_lock lk{submit_mutex};
