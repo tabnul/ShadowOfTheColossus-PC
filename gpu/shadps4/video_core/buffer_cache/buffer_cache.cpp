@@ -163,15 +163,60 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 }
 
 void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
-    liverpool->SendCommand<true>([this, device_addr, size] {
-        {
-            std::unique_lock gpu_modified_lock{gpu_modified_mutex};
-            gpu_modified_ranges.Subtract(device_addr, size);
+    // sotc: SOTC_DROP_ASYNC=0: the unmapping thread waits until the GPU side has run the drop.
+    // That wait (the draw thread may itself wait for the memory runtime's lock, held by the next
+    // map) was the longest part of the unmap stalls: 60-120 ms frames whenever the game streams.
+    // Now the drop is queued at the command processor's point of the stream, like ReleaseMemory:
+    // draws queued before the unmap still see the range, later ones do not. Until it runs, every
+    // readback applies it first (ApplyPendingDrops), so no stale GPU data reaches the range.
+    static const bool async = [] {
+        const char* v = std::getenv("SOTC_DROP_ASYNC");
+        return !v || v[0] != '0';
+    }();
+    if (!async) {
+        liverpool->SendCommand<true>([this, device_addr, size] { ApplyDrop(device_addr, size); });
+        return;
+    }
+    {
+        std::scoped_lock lock{pending_drops_mutex};
+        pending_drops.emplace_back(device_addr, size);
+        num_pending_drops.store(pending_drops.size(), std::memory_order_release);
+    }
+    liverpool->SendOrderedCommand([this, device_addr, size] {
+        ApplyDrop(device_addr, size);
+        std::scoped_lock lock{pending_drops_mutex};
+        const auto it = std::ranges::find(pending_drops, std::pair{device_addr, size});
+        if (it != pending_drops.end()) {
+            pending_drops.erase(it);
         }
-        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
-        MarkInflightReadbacksDirty(device_addr, size);
-        memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        num_pending_drops.store(pending_drops.size(), std::memory_order_release);
     });
+}
+
+void BufferCache::ApplyDrop(VAddr device_addr, u64 size) {
+    {
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.Subtract(device_addr, size);
+    }
+    memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
+    MarkInflightReadbacksDirty(device_addr, size, 1);
+    memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+}
+
+void BufferCache::ApplyPendingDrops() {
+    // GPU side, before a readback: the drops of unmaps queued but not yet reached by the stream.
+    // They stay queued; running one again later only clears what earlier draws wrote since.
+    if (num_pending_drops.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    boost::container::small_vector<std::pair<VAddr, u64>, 16> drops;
+    {
+        std::scoped_lock lock{pending_drops_mutex};
+        drops.assign(pending_drops.begin(), pending_drops.end());
+    }
+    for (const auto& [addr, size] : drops) {
+        ApplyDrop(addr, size);
+    }
 }
 
 void BufferCache::MarkWriteAhead(VAddr addr) {
@@ -254,14 +299,76 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         return;
     }
     // The guest thread waits for the GPU, not the command processor.
-    AsyncReadback readback{.device_addr = device_addr, .size = size, .is_write = is_write};
-    liverpool->SendCommand<true>([this, &readback] { BeginAsyncReadback(readback); });
-    if (!readback.waiting) {
-        return;
+    // sotc: SOTC_RB_LOG=<us>: readbacks slower than that, per phase (begin on the draw thread,
+    // the GPU, finish on the draw thread).
+    static const s64 log_us = [] {
+        const char* v = std::getenv("SOTC_RB_LOG");
+        return v ? std::atoll(v) : 0;
+    }();
+    using Clock = std::chrono::steady_clock;
+    // sotc: a readback whose asked bytes the GPU wrote again while it was in flight is done
+    // again (asynchronously, up to twice) instead of read back on the command processor.
+    for (u32 retries_left = 2;; --retries_left) {
+        const auto t0 = Clock::now();
+        AsyncReadback readback{.device_addr = device_addr, .size = size, .is_write = is_write,
+                               .retries_left = retries_left,
+                               .read_seq = liverpool->GuestSubmitSeq()};
+        liverpool->SendCommand<true>([this, &readback] { BeginAsyncReadback(readback); });
+        if (!readback.waiting) {
+            return;
+        }
+        const auto t1 = Clock::now();
+        const auto t1s = Clock::now();
+        WaitReadback(readback);
+        const auto t2 = Clock::now();
+        Clock::time_point finish_start{};
+        for (;;) {
+            liverpool->SendCommand<true>([this, &readback, &finish_start] {
+                finish_start = Clock::now();
+                FinishAsyncReadback(readback);
+            });
+            if (!readback.rewait) {
+                break;
+            }
+            readback.rewait = false;
+            WaitReadback(readback);
+        }
+        {
+            const auto ns = [](auto d) {
+                return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(d).count();
+            };
+            const auto t3 = Clock::now();
+            SotcStats::rb_begin_ns.fetch_add(ns(t1 - t0), std::memory_order_relaxed);
+            SotcStats::rb_gpu_ns.fetch_add(ns(t2 - t1), std::memory_order_relaxed);
+            SotcStats::rb_finish_ns.fetch_add(ns(t3 - t2), std::memory_order_relaxed);
+        }
+        if (log_us > 0) {
+            const auto us = [](auto d) {
+                return std::chrono::duration_cast<std::chrono::microseconds>(d).count();
+            };
+            const auto t3 = Clock::now();
+            if (us(t3 - t0) >= log_us) {
+                std::fprintf(stderr,
+                             "SOTCRB us=%lld begin=%lld gpu=%lld finish=%lld addr=%#llx size=%#llx "
+                             "window=%#llx dl=%#llx dep=%d write=%d dirty=%d queued=%lld left=%u sub=%lld dsite=%u dprog=%#llx past=%d fut=%d rc=%u oth=%d\n",
+                             (long long)us(t3 - t0), (long long)us(t1 - t0), (long long)us(t2 - t1),
+                             (long long)us(t3 - t2), (unsigned long long)device_addr,
+                             (unsigned long long)size, (unsigned long long)readback.window_size,
+                             (unsigned long long)readback.download_size, readback.dependent ? 1 : 0,
+                             is_write ? 1 : 0,
+                             readback.dirty ? (readback.dirty_ranges.Intersects(device_addr, size) ? 1 : 2) : 0,
+                             (long long)us(finish_start - t2), retries_left,
+                             (long long)us(t1s - t1), readback.dirty_site,
+                             (unsigned long long)readback.dirty_program, readback.dirty_past ? 1 : 0,
+                             readback.dirty_future ? 1 : 0, readback.recopies,
+                             readback.dirty_other ? 1 : 0);
+            }
+        }
+        if (!readback.retry) {
+            return;
+        }
+        SotcStats::readback_retries.fetch_add(1, std::memory_order_relaxed);
     }
-    scheduler.WaitSubmitted(readback.tick, false);
-    scheduler.GetWorkSemaphore()->Wait(readback.tick);
-    liverpool->SendCommand<true>([this, &readback] { FinishAsyncReadback(readback); });
 }
 
 void BufferCache::MarkWrittenByGuest(VAddr addr, u64 size) {
@@ -282,6 +389,30 @@ void BufferCache::MarkWrittenByGuest(VAddr addr, u64 size) {
         memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
     }
     memory_tracker->MarkRegionAsCpuModified(addr, size);
+}
+
+bool BufferCache::WrittenByCurrent(std::span<const ReadbackItem> items) {
+    if (current_writes_tick != scheduler.CurrentTick()) {
+        current_writes.Clear();
+        current_writes_tick = scheduler.CurrentTick();
+    }
+    for (const auto& item : items) {
+        for (const auto& copy : item.copies) {
+            if (current_writes.Intersects(item.arena->cpu_addr + copy.srcOffset, copy.size)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool BufferCache::ReadbackDone(const AsyncReadback& readback) {
+    return scheduler.IsFree(readback.tick);
+}
+
+void BufferCache::WaitReadback(const AsyncReadback& readback) {
+    scheduler.WaitSubmitted(readback.tick, false);
+    scheduler.GetWorkSemaphore()->Wait(readback.tick);
 }
 
 void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
@@ -331,14 +462,95 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
     SotcStats::readback_finish.fetch_add(1, std::memory_order_relaxed);
 }
 
-void BufferCache::MarkInflightReadbacksDirty(VAddr addr, u64 size) {
+// sotc: SOTC_RB_RECOPY=<n> (default 0: off): an in-flight readback whose copied bytes a GPU
+// write changes has its copies recorded again after the writing op, up to n times, instead of
+// being read back again from the guest thread.
+static const u32 recopy_max = [] {
+    const char* v = std::getenv("SOTC_RB_RECOPY");
+    return v ? static_cast<u32>(std::atoi(v)) : 0u;
+}();
+
+void BufferCache::MarkInflightReadbacksDirty(VAddr addr, u64 size, u32 site) {
     // sotc: the command processor (a GPU write, its own write or an applied readback after
     // which the guest may write) changed these bytes: asynchronous readbacks of them in flight
     // hold stale data (FinishAsyncReadback reads them back again).
     for (AsyncReadback* readback : inflight_readbacks) {
         for (const auto& item : readback->pending) {
-            readback->dirty |= addr < item.addr + item.size && item.addr < addr + size;
+            if (addr < item.addr + item.size && item.addr < addr + size) {
+                if (site == 3 && readback->recopies < recopy_max) {
+                    readback->needs_recopy = true; // copied again after the writing op
+                    recopy_pending = true;
+                } else {
+                    readback->dirty_other = true;
+                }
+                if (!readback->dirty) {
+                    readback->dirty_site = site;
+                    readback->dirty_program = SotcStats::current_program.load();
+                }
+                if (site == 3 && liverpool->ExecSubmitSeq() > readback->read_seq) {
+                    readback->dirty_future = true;
+                } else {
+                    readback->dirty_past = true;
+                }
+                readback->dirty = true;
+                const VAddr lo = Common::AlignDown(addr, VAddr{4096});
+                readback->dirty_ranges.Add(lo, Common::AlignUp(addr + size, VAddr{4096}) - lo);
+            }
         }
+    }
+}
+
+void BufferCache::DoRecopyReadbacks() {
+    recopy_pending = false;
+    bool recorded = false;
+    for (AsyncReadback* readback : inflight_readbacks) {
+        if (!readback->needs_recopy) {
+            continue;
+        }
+        readback->needs_recopy = false;
+        // Gather again: the write may have made more of the window GPU-modified, and the bound
+        // ranges may have changed since.
+        const u32 first_block = readback->device_addr >> block_shift;
+        const u32 last_block = (readback->device_addr + readback->size - 1) >> block_shift;
+        const auto* arena = GetArena(first_block, last_block);
+        boost::container::small_vector<ReadbackItem, 16> pending;
+        const u64 total =
+            GatherDownloads(arena, readback->window_start, readback->window_size, pending, false);
+        if (total == 0) {
+            continue; // stays dirty: read back again the usual way
+        }
+        ++readback->recopies;
+        if (!readback->dirty_other) {
+            readback->dirty = false;
+            readback->dirty_ranges.Clear();
+        }
+        staging_pool.FreeDeferred(Vulkan::StagingBufferRef{
+            .buffer = readback->download_buffer,
+            .offset = readback->download_offset,
+            .size = readback->download_size,
+            .mapped = const_cast<u8*>(readback->download_mapped),
+            .type = VideoCore::MemoryType::HostCached,
+        });
+        const auto download =
+            staging_pool.Request(total, VideoCore::MemoryType::HostCached, 0, true);
+        for (auto& item : pending) {
+            for (auto& copy : item.copies) {
+                copy.dstOffset += download.offset;
+            }
+            runtime.CopyBuffer(item.arena, download.buffer, item.copies);
+        }
+        readback->arena = arena;
+        readback->pending = std::move(pending);
+        readback->download_buffer = download.buffer;
+        readback->download_size = download.size;
+        readback->download_offset = download.offset;
+        readback->download_mapped = download.mapped;
+        readback->tick = scheduler.CurrentTick();
+        recorded = true;
+        SotcStats::readback_recopies.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (recorded) {
+        scheduler.Flush();
     }
 }
 
@@ -360,6 +572,11 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
     if (readback.dependent) {
         // Finish the readbacks this one waited for (owners still blocked keep them alive).
         while (AsyncReadback* other = FindInflightReadback(readback.device_addr, readback.size)) {
+            if (!ReadbackDone(*other)) {
+                readback.tick = other->tick; // copied again since: wait for that
+                readback.rewait = true;
+                return;
+            }
             FinishAsyncReadback(*other);
         }
         if (readback.is_write) {
@@ -373,6 +590,10 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
         }
         return;
     }
+    if (!ReadbackDone(readback)) {
+        readback.rewait = true; // copied again after the guest thread's wait
+        return;
+    }
     readback.finished = true;
     std::erase(inflight_readbacks, &readback);
     const Vulkan::StagingBufferRef download{
@@ -382,7 +603,62 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
         .mapped = const_cast<u8*>(readback.download_mapped),
         .type = VideoCore::MemoryType::HostCached,
     };
-    if (readback.dirty) {
+    // sotc: SOTC_RB_PARTIAL=0: a dirty readback reads its whole window back again, waiting for
+    // the GPU on the command processor (hitches of up to ~40 ms, other threads' finishes queued
+    // behind it), the old way.
+    static const bool partial = [] {
+        const char* v = std::getenv("SOTC_RB_PARTIAL");
+        return !v || std::atoi(v) != 0;
+    }();
+    const bool asked_dirty =
+        readback.dirty && readback.dirty_ranges.Intersects(readback.device_addr, readback.size);
+    if (readback.dirty && partial && (!asked_dirty || readback.retries_left > 0)) {
+        // Apply what did not change since the copies (mostly hot regions brought along). The
+        // changed pages stay as they are: GPU-modified (a later GPU write; the next read brings
+        // it) or already applied or dropped. When the asked bytes changed, ReadMemory reads them
+        // back again.
+        boost::container::small_vector<ReadbackItem, 16> clean;
+        for (const auto& item : readback.pending) {
+            RangeSet left;
+            left.Add(item.addr, item.size);
+            readback.dirty_ranges.ForEachInRange(item.addr, item.size,
+                                                 [&](VAddr a, VAddr b) { left.Subtract(a, b - a); });
+            left.ForEach([&](VAddr a, VAddr b) {
+                ReadbackItem part{item.arena, a, b - a, {}, {}};
+                for (const auto& copy : item.copies) {
+                    const VAddr start = item.arena->cpu_addr + copy.srcOffset;
+                    const VAddr lo = std::max(start, a);
+                    const VAddr hi = std::min(start + copy.size, b);
+                    if (lo < hi) {
+                        part.copies.push_back(vk::BufferCopy{
+                            .srcOffset = copy.srcOffset + (lo - start),
+                            .dstOffset = copy.dstOffset + (lo - start),
+                            .size = hi - lo,
+                        });
+                    }
+                }
+                for (const auto& [range_addr, range_size] : item.gpu_ranges) {
+                    const VAddr lo = std::max(range_addr, a);
+                    const VAddr hi = std::min(range_addr + range_size, b);
+                    if (lo < hi) {
+                        part.gpu_ranges.emplace_back(lo, hi - lo);
+                    }
+                }
+                if (!part.gpu_ranges.empty()) {
+                    clean.push_back(std::move(part));
+                }
+            });
+        }
+        download.buffer->Invalidate(download.offset, download.size);
+        ApplyDownloads(clean, download.mapped, download.offset);
+        SubtractDownloaded(clean);
+        staging_pool.FreeDeferred(download);
+        SotcStats::readback_partial.fetch_add(1, std::memory_order_relaxed);
+        if (asked_dirty) {
+            readback.retry = true;
+            return;
+        }
+    } else if (readback.dirty) {
         // A GPU write recorded after the copies (or another readback applied first and the
         // guest may have written since): the data may be stale. The ranges never left the
         // GPU-modified set; read the window back the usual way.
@@ -412,17 +688,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     }
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     // Was the data written by work already submitted, or by the command buffer being built?
-    if (current_writes_tick != scheduler.CurrentTick()) {
-        current_writes.Clear();
-        current_writes_tick = scheduler.CurrentTick();
-    }
-    bool written_by_current = false;
-    for (const auto& item : pending) {
-        for (const auto& copy : item.copies) {
-            written_by_current |=
-                current_writes.Intersects(item.arena->cpu_addr + copy.srcOffset, copy.size);
-        }
-    }
+    const bool written_by_current = WrittenByCurrent(pending);
     for (auto& item : pending) {
         for (auto& copy : item.copies) {
             copy.dstOffset += download.offset;
@@ -504,6 +770,7 @@ void BufferCache::SubtractDownloaded(std::span<const ReadbackItem> items) {
 u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 size,
                                  boost::container::small_vector<ReadbackItem, 16>& pending,
                                  bool subtract) {
+    ApplyPendingDrops();
     // A readback costs a full CPU/GPU sync. Games tend to read back the same few regions every
     // frame, one after another, so while the GPU is idle anyway also bring along the other
     // regions read back recently ("hot" readbacks) that the GPU has modified since. The reads
@@ -859,7 +1126,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
             });
         }
         memory_tracker->UnmarkRegionAsGpuModified(item.addr, item.size, false);
-        MarkInflightReadbacksDirty(item.addr, item.size);
+        MarkInflightReadbacksDirty(item.addr, item.size, 2);
     }
 }
 
@@ -900,7 +1167,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
 }
 
 void BufferCache::AddGpuModified(VAddr addr, u64 size) {
-    MarkInflightReadbacksDirty(addr, size);
+    MarkInflightReadbacksDirty(addr, size, 3);
     // sotc: SOTC_GPUMOD_WATCH=<address>: who marks it as GPU-written (first 40 times).
     static const VAddr env_watch = [] {
         const char* v = std::getenv("SOTC_GPUMOD_WATCH");
@@ -1083,7 +1350,7 @@ bool BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
         gpu_modified_ranges.Subtract(addr, size);
     }
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
-    MarkInflightReadbacksDirty(addr, size);
+    MarkInflightReadbacksDirty(addr, size, 4);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
         return false;
     }
@@ -1123,7 +1390,7 @@ bool BufferCache::TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size)
         gpu_modified_ranges.Subtract(addr, size);
     }
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
-    MarkInflightReadbacksDirty(addr, size);
+    MarkInflightReadbacksDirty(addr, size, 5);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
         return false;
     }

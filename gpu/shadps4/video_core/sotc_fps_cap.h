@@ -6,7 +6,7 @@
 // does (sotc_modes.py, the import stub returns at once). Here the rate the game asks is kept and
 // the vblank thread (VideoOutDriver::PresentThread) applies it or not. SOTC_FPS_CAP=off starts
 // uncapped (the launcher's "Uncapped FPS"), 30 or unset capped. Uncapped needs vblanks at 120 Hz
-// (BB_VBLANK_HZ=120, set by the launcher and sotc.py), else a frame still waits for a 60 Hz one.
+// (BB_VBLANK_HZ=240, set by the launcher and sotc.py), else a frame still waits for a 60 Hz one.
 
 #pragma once
 

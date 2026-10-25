@@ -493,7 +493,7 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcStats::ov_readbacks_per_s.store(float(readbacks / seconds));
             SotcStats::ov_readback_ms_per_s.store(float(readback_ns / 1e6 / seconds));
             ReportPrintf(report,
-                         "SOTC FPS %.1f at %.0fs; %.0f cmds/frame; readbacks %.0f/s (ahead %llu, finish %llu, heap %llu, early %llu), %.0f ms/s; "
+                         "SOTC FPS %.1f at %.0fs; %.0f cmds/frame; readbacks %.0f/s (ahead %llu, finish %llu, heap %llu, early %llu), %.0f ms/s, async waits begin/gpu/finish %.0f/%.0f/%.0f ms/s; "
                          "changed copies %llu/%llu, bytes %llu/%llu; vram %llu/%llu MB, "
                          "arenas %llu (%llu MB)\n",
                          flips / seconds, std::chrono::duration<double>(now - run_start).count(),
@@ -503,6 +503,9 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(SotcStats::heap_guard_builds.exchange(0)),
                          static_cast<unsigned long long>(SotcStats::early_flushes.exchange(0)),
                          readback_ns / 1e6 / seconds,
+                         SotcStats::rb_begin_ns.exchange(0) / 1e6 / seconds,
+                         SotcStats::rb_gpu_ns.exchange(0) / 1e6 / seconds,
+                         SotcStats::rb_finish_ns.exchange(0) / 1e6 / seconds,
                          static_cast<unsigned long long>(copies_changed),
                          static_cast<unsigned long long>(copies),
                          static_cast<unsigned long long>(bytes_changed),

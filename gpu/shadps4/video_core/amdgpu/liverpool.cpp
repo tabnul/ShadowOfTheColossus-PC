@@ -153,6 +153,9 @@ void Liverpool::BackLoop(std::stop_token stoken) {
         }
         BackOp& op = back_ring[tail % BackRingSize];
         ExecuteBackOp(op);
+        if (rasterizer) {
+            rasterizer->GetBufferCache().RecopyReadbacks();
+        }
         op.func = {};
         ++tail;
         back_tail.store(tail, std::memory_order_seq_cst);
@@ -202,6 +205,7 @@ Liverpool::BackOp& Liverpool::BackAlloc() {
     }
     BackOp& op = back_ring[head % BackRingSize];
     op.pipeline = nullptr;
+    op.submit_seq = cp_submit_seq;
     op.num_stages = 0;
     // The registers as of this point of the command stream: the chunks changed since the last op.
     op.reg_chunks.clear();
@@ -291,6 +295,7 @@ static bool PipelineWrites(const Vulkan::Pipeline* pipeline) {
 }
 
 void Liverpool::ExecuteBackOp(BackOp& op) {
+    exec_submit_seq.store(op.submit_seq, std::memory_order_relaxed);
     for (size_t i = 0; i < op.reg_chunks.size(); i += RegChunkDwords + 1) {
         std::memcpy(&back_regs.reg_array[op.reg_chunks[i] * RegChunkDwords], &op.reg_chunks[i + 1],
                     RegChunkDwords * sizeof(u32));
@@ -488,6 +493,7 @@ void Liverpool::Process(std::stop_token stoken) {
                     continue;
                 }
                 task = queue.submits.front();
+                cp_submit_seq = queue.submit_seqs.front();
             }
             const u64 parse_start = SotcStats::NowNs();
             task.resume();
@@ -499,6 +505,7 @@ void Liverpool::Process(std::stop_token stoken) {
 
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
+                queue.submit_seqs.pop();
 
                 --num_submits;
                 std::scoped_lock lock2{submit_mutex};
@@ -1710,6 +1717,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        queue.submit_seqs.push(guest_submit_seq.fetch_add(1) + 1);
     }
 
     std::scoped_lock lk{submit_mutex};
@@ -1726,6 +1734,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        queue.submit_seqs.push(guest_submit_seq.fetch_add(1) + 1);
     }
 
     std::scoped_lock lk{submit_mutex};

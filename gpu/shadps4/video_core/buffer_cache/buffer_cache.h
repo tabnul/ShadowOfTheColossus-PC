@@ -4,12 +4,14 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 
 #include <chrono>
 #include <shared_mutex>
 #include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <vector>
@@ -92,6 +94,8 @@ public:
 
     /// sotc: forgets that the GPU wrote this range, without downloading it (unmap test).
     void DropGpuModified(VAddr device_addr, u64 size);
+    void ApplyDrop(VAddr device_addr, u64 size);
+    void ApplyPendingDrops();
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
@@ -147,6 +151,13 @@ public:
 
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
+
+    /// sotc: after each back op: records again the copies of in-flight readbacks the op wrote.
+    void RecopyReadbacks() {
+        if (recopy_pending) {
+            DoRecopyReadbacks();
+        }
+    }
 
     /// Releases the arena memory backing a range the guest unmapped. GPU thread only.
     void ReleaseMemory(VAddr device_addr, u64 size);
@@ -213,14 +224,37 @@ private:
     /// processor: the copies are recorded and submitted without waiting (the command processor
     /// goes on with its queue), the guest thread waits for the GPU, then the data is applied
     /// unless a later GPU write hit the ranges meanwhile (then it is read back again).
+    struct AsyncReadback;
+    bool ReadbackDone(const AsyncReadback& readback);
+    void WaitReadback(const AsyncReadback& readback);
+    bool WrittenByCurrent(std::span<const ReadbackItem> items);
+
     struct AsyncReadback {
         VAddr device_addr{};
         u64 size{};
         bool is_write{};
         bool waiting{};
         bool dirty{};
+        /// sotc: what changed while it was in flight (page aligned); the rest of the copy holds
+        /// valid data and is applied.
+        RangeSet dirty_ranges{};
         bool dependent{};
         bool finished{};
+        /// sotc: the asked bytes changed while in flight; ReadMemory starts another readback.
+        bool retry{};
+        u32 retries_left{};
+        u32 dirty_site{};
+        u64 read_seq{};
+        bool dirty_past{};
+        bool dirty_future{};
+        u64 dirty_program{};
+        /// sotc: a GPU write in the window: it is gathered and copied again after the op that
+        /// wrote (RecopyReadbacks), the guest thread then waits for the new tick.
+        bool needs_recopy{};
+        /// sotc: dirtied by more than recopy-able GPU writes (a recopy keeps it dirty).
+        bool dirty_other{};
+        bool rewait{};
+        u32 recopies{};
         u64 tick{};
         const Buffer* arena{};
         VAddr window_start{};
@@ -237,8 +271,11 @@ private:
     void MarkWrittenByGuest(VAddr addr, u64 size);
     void FinishAsyncReadback(AsyncReadback& readback);
     AsyncReadback* FindInflightReadback(VAddr addr, u64 size);
-    void MarkInflightReadbacksDirty(VAddr addr, u64 size);
+    /// site: who (SOTCRB dsite): 1 drop, 2 applied download, 3 GPU write, 4/5 CPU write.
+    void MarkInflightReadbacksDirty(VAddr addr, u64 size, u32 site);
     std::vector<AsyncReadback*> inflight_readbacks;
+    bool recopy_pending{};
+    void DoRecopyReadbacks();
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
@@ -260,6 +297,9 @@ private:
     /// sotc: gpu_modified_ranges is changed on the GPU side (the draw thread, see
     /// Liverpool::IsBackThreaded) and read by the command processor's SRT walkers (ReadClean).
     std::shared_mutex gpu_modified_mutex;
+    std::mutex pending_drops_mutex; // sotc: DropGpuModified queued, not yet run
+    std::vector<std::pair<VAddr, u64>> pending_drops;
+    std::atomic<size_t> num_pending_drops{0};
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;

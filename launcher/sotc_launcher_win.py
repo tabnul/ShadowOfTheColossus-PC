@@ -496,7 +496,9 @@ def game_environment(s):
     env['SOTC_MODES'] = ','.join(modes)
     env['SOTC_FPS_CAP'] = '30' if fps_mode == '30' else 'off'
     env['SOTC_FPS_LIMIT'] = '60' if fps_mode == '60' else '0'
-    env['BB_VBLANK_HZ'] = '120'
+    # 240 Hz vblanks: a finished frame is shown within ~4 ms, not at the next 120 Hz tick (pan30
+    # replay: frames over 33 ms 17 -> 8 at the same average). Bloodborne ports use 480-1000 Hz.
+    env['BB_VBLANK_HZ'] = '240'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
     env['BB_PRESENT_MODE'] = s['present_mode']
     if s['language']:

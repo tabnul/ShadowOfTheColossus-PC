@@ -205,9 +205,9 @@ def main():
     # 9152 MiB the wide render sizes already used.
     env.setdefault('BB_DMEM_MB', '9152')
     # The game waits for vblanks: at 60 Hz an uncapped frame (fps60, or F7 in game) still rounds
-    # up to 30 FPS. With the cap, 120 Hz only shows a late frame sooner (and SOTC_FPS_LIMIT counts
-    # in 120 Hz vblanks).
-    env.setdefault('BB_VBLANK_HZ', '120')
+    # up to 30 FPS. With the cap, 240 Hz only shows a late frame sooner (and SOTC_FPS_LIMIT counts
+    # in 240 Hz vblanks; 240 instead of 120 halved the frames over 33 ms on the pan30 replay).
+    env.setdefault('BB_VBLANK_HZ', '240')
     if 'hdr' in modes.lower():
         # HDR10 swapchain (Rec.2020 PQ, when Windows HDR is on); the game then offers HDR too.
         env.setdefault('BB_HDR', '1')

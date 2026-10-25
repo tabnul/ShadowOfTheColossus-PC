@@ -71,6 +71,12 @@ struct Liverpool {
     CbDbExtent last_db_extent{};
 
 public:
+    u64 GuestSubmitSeq() const noexcept {
+        return guest_submit_seq.load(std::memory_order_acquire);
+    }
+    u64 ExecSubmitSeq() const noexcept {
+        return exec_submit_seq.load(std::memory_order_relaxed);
+    }
     explicit Liverpool();
     ~Liverpool();
 
@@ -299,6 +305,7 @@ private:
         std::vector<u32> dcb_buffer;
         std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
+        std::queue<u64> submit_seqs{}; // sotc: guest submit order of `submits`
         ComputeProgram cs_state{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
@@ -331,6 +338,11 @@ private:
     const bool guest_markers_enabled;
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
+    // sotc: guest submits so far, the one the command processor parses and the one of the back
+    // op the draw thread executes (readback diagnostics: was a write queued after a read?).
+    std::atomic<u64> guest_submit_seq{0};
+    u64 cp_submit_seq{};
+    std::atomic<u64> exec_submit_seq{0};
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;
@@ -373,6 +385,7 @@ private:
         ComputeProgram cs{};
         std::array<BackStage, 5> stages{};
         u32 num_stages{};
+        u64 submit_seq{};
         Common::UniqueFunction<void> func;
     };
     static constexpr u32 RegChunkDwords = 64;

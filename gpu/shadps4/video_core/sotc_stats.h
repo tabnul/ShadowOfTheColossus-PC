@@ -20,11 +20,15 @@ namespace SotcStats {
 inline const bool kFpsLog = std::getenv("SOTC_FPS") != nullptr;
 inline const bool kCmdStats = std::getenv("SOTC_CMD_STATS") != nullptr;
 inline std::atomic<uint64_t> readbacks{0};    ///< BufferCache::DownloadMemory calls
+inline std::atomic<uint64_t> rb_begin_ns{0}, rb_gpu_ns{0}, rb_finish_ns{0}; ///< sotc: async readback guest waits per phase
 inline std::atomic<uint64_t> readback_ns{0};  ///< time spent in them (copy and wait)
 inline std::atomic<uint64_t> watch_addr{0};     ///< SOTC_CS_WATCH: GPU writes to report
 inline std::atomic<uint64_t> current_program{0}; ///< hash of the dispatch being recorded (1 = a draw)
 inline std::atomic<uint64_t> readback_ahead{0};   ///< downloads of already submitted work
 inline std::atomic<uint64_t> readback_finish{0};  ///< downloads that flushed the current work
+inline std::atomic<uint64_t> readback_partial{0}; ///< sotc: dirty async readbacks applied in part
+inline std::atomic<uint64_t> readback_recopies{0}; ///< sotc: in-flight readback copies recorded again after a GPU write
+inline std::atomic<uint64_t> readback_retries{0}; ///< sotc: async readbacks done again (asked bytes changed)
 inline std::atomic<uint64_t> readback_finish_asked{0}; ///< ... for bytes the guest itself asked
 inline std::atomic<uint64_t> heap_guard_builds{0}; ///< readbacks into the BPE heap
 inline std::atomic<uint64_t> readback_copies{0};          ///< ranges downloaded
