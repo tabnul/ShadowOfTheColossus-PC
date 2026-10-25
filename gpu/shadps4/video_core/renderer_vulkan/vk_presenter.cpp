@@ -1318,6 +1318,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         if (every != 0) {
             static u64 frames = 0;
             static const auto t0 = std::chrono::steady_clock::now();
+            if (frames == 0) {
+                // the clock of SOTC_SPIKE_OUT samples (steady_clock is QueryPerformanceCounter)
+                std::fprintf(stderr, "SOTCCLOCK t0=%lld\n",
+                             static_cast<long long>(
+                                 std::chrono::duration_cast<std::chrono::microseconds>(
+                                     t0.time_since_epoch())
+                                     .count()));
+            }
             if (++frames % every == 0) {
                 const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                                     std::chrono::steady_clock::now() - t0)

@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <deque>
 #include <queue>
 
 #include "common/interval_set.h"
@@ -534,6 +535,22 @@ private:
     u64 ahead_sequence{};
     bool ahead_unfinished{};
     tracy::VkCtxScope* profiler_scope{};
+    // sotc: SOTC_GPU_TIME=1 timestamps every submit and logs GPU busy time and idle gaps.
+    void GpuTimeBegin();
+    void GpuTimeEnd(u64 tick, u32 waits);
+    vk::UniqueQueryPool gpu_time_pool;
+    u32 gpu_time_next{};
+    bool gpu_time_open{};
+    struct GpuTimeSubmit {
+        u64 tick;
+        u32 pair;
+        u32 waits;
+    };
+    std::deque<GpuTimeSubmit> gpu_time_pending;
+    u64 gpu_time_prev_end{};
+    double gpu_time_busy{}, gpu_time_gap{}, gpu_time_max_gap{}, gpu_time_wait_gap{};
+    u32 gpu_time_subs{}, gpu_time_wait_subs{}, gpu_time_long_gaps{};
+    std::chrono::steady_clock::time_point gpu_time_print{};
     /// Newest tick the recording thread has put on the queue.
     std::atomic<u64> recorded_submit_tick{0};
     /// Last member: stops (after running everything queued) before the rest is destroyed.

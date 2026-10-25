@@ -46,6 +46,11 @@ public:
     }
 
     /// Returns the Vulkan device
+    /// Nanoseconds per timestamp tick.
+    float GetTimestampPeriod() const {
+        return properties.limits.timestampPeriod;
+    }
+
     vk::Device GetDevice() const {
         return *device;
     }

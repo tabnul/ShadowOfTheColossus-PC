@@ -814,8 +814,15 @@ void VideoOutDriver::DrawLastFrame() {
         true);
 }
 
+// sotc: the game's flip submissions, its frames (src/runtime_pad.c replays a route by them).
+static std::atomic<uint64_t> guest_frames{0};
+extern "C" uint64_t bbgpu_guest_frames(void) {
+    return guest_frames.load(std::memory_order_relaxed);
+}
+
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
+    guest_frames.fetch_add(1, std::memory_order_relaxed);
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {

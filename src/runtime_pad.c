@@ -412,8 +412,14 @@ static void read_inject(void) {
 /* BB_PAD_RECORD=<file>: F9 starts and stops recording the pad state (gamepad or keyboard) with
  * the time since F9; BB_PAD_REPLAY=<file> plays such a recording back, started by the token
  * "replay" in BB_PAD_FILE (scripted tests repeat a route the player ran once). Lines: ms buttons
- * lx ly rx ry l2 r2, written when the state changes. */
-typedef struct { uint32_t ms, buttons; uint8_t axes[4], l2, r2; } PadSample;
+ * lx ly rx ry l2 r2 frame, written when the state changes. sotc: frame counts the game's flips
+ * since the start (bbgpu_guest_frames); a replay follows it, not ms, when the file has it
+ * (BB_PAD_SYNC=ms: by time). By time, a run whose frame times differed from the recording's
+ * (a hitch fixed or added) left the route. */
+typedef struct { uint32_t ms, buttons; uint8_t axes[4], l2, r2; uint32_t frame; } PadSample;
+uint64_t bbgpu_guest_frames(void); /* gpu/shadps4/core/libraries/videoout/driver.cpp */
+static uint64_t record_frame0, replay_frame0;
+static int replay_by_frame;
 static FILE *record_file;
 static uint64_t record_start;
 static PadSample record_last;
@@ -426,24 +432,34 @@ static void record_sample(const PadData *d) {
     const int requested=record_requested==1 && !record_file;
     if (record_requested==1) record_requested=2;
     if ((f9 && !f9_was_down) || requested) {
+        /* sotc: a recording started again in the same run goes to <file>.2, .3 ...: reopening the
+         * file would throw away the one just made. */
+        static int takes;
+        static char take_path[1024];
+        if (!record_file) {
+            if (takes++) snprintf(take_path,sizeof take_path,"%s.%d",path,takes);
+            else snprintf(take_path,sizeof take_path,"%s",path);
+        }
         if (record_file) {
             fclose(record_file); record_file=NULL;
-            printf("Runtime: pad recording stopped (%s)\n",path);
-        } else if ((record_file=fopen(path,"w"))) {
+            printf("Runtime: pad recording stopped (%s)\n",take_path);
+        } else if ((record_file=fopen(take_path,"w"))) {
             record_start=now_us();
+            record_frame0=bbgpu_guest_frames();
             memset(&record_last,0xff,sizeof(record_last));
-            printf("Runtime: pad recording started (%s, F9 stops)\n",path);
+            printf("Runtime: pad recording started (%s, F9 stops)\n",take_path);
         }
     }
     f9_was_down=f9;
     if (!record_file) return;
     PadSample s={(uint32_t)((now_us()-record_start)/1000),d->buttons,
-                 {d->left_x,d->left_y,d->right_x,d->right_y},d->l2,d->r2};
+                 {d->left_x,d->left_y,d->right_x,d->right_y},d->l2,d->r2,
+                 (uint32_t)(bbgpu_guest_frames()-record_frame0)};
     if (s.buttons==record_last.buttons && !memcmp(s.axes,record_last.axes,4) &&
         s.l2==record_last.l2 && s.r2==record_last.r2) return;
     record_last=s;
-    fprintf(record_file,"%u %u %u %u %u %u %u %u\n",s.ms,s.buttons,s.axes[0],s.axes[1],s.axes[2],
-            s.axes[3],s.l2,s.r2);
+    fprintf(record_file,"%u %u %u %u %u %u %u %u %u\n",s.ms,s.buttons,s.axes[0],s.axes[1],s.axes[2],
+            s.axes[3],s.l2,s.r2,s.frame);
     fflush(record_file);
 }
 static PadSample *replay; static size_t replay_count, replay_next;
@@ -455,22 +471,30 @@ static void replay_sample(PadData *d) {
             loaded=1;
             const char *path=getenv("BB_PAD_REPLAY");
             FILE *f=path ? fopen(path,"r") : NULL;
-            PadSample s; unsigned v[8]; size_t cap=0;
-            while (f && fscanf(f,"%u %u %u %u %u %u %u %u",&v[0],&v[1],&v[2],&v[3],&v[4],&v[5],&v[6],&v[7])==8) {
-                s=(PadSample){v[0],v[1],{(uint8_t)v[2],(uint8_t)v[3],(uint8_t)v[4],(uint8_t)v[5]},(uint8_t)v[6],(uint8_t)v[7]};
+            PadSample s; unsigned v[9]; size_t cap=0; char line[160]; int frames=1;
+            while (f && fgets(line,sizeof(line),f)) {
+                const int n=sscanf(line,"%u %u %u %u %u %u %u %u %u",&v[0],&v[1],&v[2],&v[3],&v[4],&v[5],&v[6],&v[7],&v[8]);
+                if (n<8) break;
+                if (n<9) { frames=0; v[8]=0; }
+                s=(PadSample){v[0],v[1],{(uint8_t)v[2],(uint8_t)v[3],(uint8_t)v[4],(uint8_t)v[5]},(uint8_t)v[6],(uint8_t)v[7],v[8]};
                 if (replay_count==cap && !(replay=realloc(replay,(cap=cap ? cap*2 : 1024)*sizeof(*replay)))) break;
                 replay[replay_count++]=s;
             }
             if (f) fclose(f);
-            printf("Runtime: pad replay of %zu samples from %s\n",replay_count,path ? path : "(unset)");
+            const char *sync=getenv("BB_PAD_SYNC");
+            replay_by_frame=frames && replay_count && !(sync && !strcmp(sync,"ms"));
+            printf("Runtime: pad replay of %zu samples from %s (by %s)\n",replay_count,path ? path : "(unset)",
+                   replay_by_frame ? "frame" : "time");
         }
         replay_start=now_us();
+        replay_frame0=bbgpu_guest_frames();
         replay_next=0;
     }
     const uint32_t ms=(uint32_t)((now_us()-replay_start)/1000);
-    while (replay_next<replay_count && replay[replay_next].ms<=ms) ++replay_next;
+    const uint32_t frame=(uint32_t)(bbgpu_guest_frames()-replay_frame0);
+    while (replay_next<replay_count && (replay_by_frame ? replay[replay_next].frame<=frame : replay[replay_next].ms<=ms)) ++replay_next;
     if (!replay_next) return;
-    if (replay_next==replay_count && ms>replay[replay_count-1].ms+500) {
+    if (replay_next==replay_count && (replay_by_frame ? frame>replay[replay_count-1].frame+30 : ms>replay[replay_count-1].ms+500)) {
         if (replay_armed==1) { puts("Runtime: pad replay finished"); replay_armed=2; }
         return;
     }

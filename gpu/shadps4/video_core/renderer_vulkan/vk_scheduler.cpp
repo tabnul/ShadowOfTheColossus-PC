@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include "common/assert.h"
 #include "common/debug.h"
@@ -13,11 +16,76 @@
 #include <chrono>
 #include <span>
 #include <boost/container/small_vector.hpp>
-#include <immintrin.h>
 
 namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
+
+static constexpr u32 GpuTimePairs = 4096;
+
+void Scheduler::GpuTimeBegin() {
+    gpu_time_open = gpu_time_pool && gpu_time_pending.size() < GpuTimePairs;
+    if (!gpu_time_open) {
+        return;
+    }
+    const u32 first = gpu_time_next * 2;
+    const vk::CommandBuffer cmdbuf = sessions.back().primary;
+    cmdbuf.resetQueryPool(*gpu_time_pool, first, 2);
+    cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *gpu_time_pool, first);
+}
+
+void Scheduler::GpuTimeEnd(u64 tick, u32 waits) {
+    if (!gpu_time_pool) {
+        return;
+    }
+    if (std::exchange(gpu_time_open, false)) {
+        EndRendering();
+        sessions.back().primary.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe,
+                                               *gpu_time_pool, gpu_time_next * 2 + 1);
+        gpu_time_pending.push_back({tick, gpu_time_next, waits});
+        gpu_time_next = (gpu_time_next + 1) % GpuTimePairs;
+    }
+    const double ms_per_tick = instance.GetTimestampPeriod() * 1e-6;
+    while (!gpu_time_pending.empty() && work_semaphore.IsFree(gpu_time_pending.front().tick)) {
+        std::array<u64, 2> ts{};
+        const auto result = instance.GetDevice().getQueryPoolResults(
+            *gpu_time_pool, gpu_time_pending.front().pair * 2, 2, sizeof(ts), ts.data(),
+            sizeof(u64), vk::QueryResultFlagBits::e64);
+        const u32 front_waits = gpu_time_pending.front().waits;
+        gpu_time_pending.pop_front();
+        if (result != vk::Result::eSuccess) {
+            continue;
+        }
+        if (gpu_time_prev_end != 0 && ts[0] > gpu_time_prev_end) {
+            const double gap = (ts[0] - gpu_time_prev_end) * ms_per_tick;
+            gpu_time_gap += gap;
+            gpu_time_max_gap = std::max(gpu_time_max_gap, gap);
+            if (front_waits != 0) {
+                gpu_time_wait_gap += gap;
+                ++gpu_time_wait_subs;
+            }
+            if (gap >= 2.0) {
+                ++gpu_time_long_gaps;
+            }
+        }
+        const u64 start = std::max(ts[0], gpu_time_prev_end);
+        if (ts[1] > start) {
+            gpu_time_busy += (ts[1] - start) * ms_per_tick;
+        }
+        gpu_time_prev_end = std::max(ts[1], gpu_time_prev_end);
+        ++gpu_time_subs;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - gpu_time_print >= std::chrono::seconds{1}) {
+        std::fprintf(stderr, "SOTC GPUT %p subs=%u busy=%.1fms gap=%.1fms maxgap=%.2fms waitsubs=%u waitgap=%.1fms gaps2ms=%u\n",
+                     static_cast<void*>(this), gpu_time_subs, gpu_time_busy, gpu_time_gap, gpu_time_max_gap, gpu_time_wait_subs,
+                     gpu_time_wait_gap, gpu_time_long_gaps);
+        gpu_time_print = now;
+        gpu_time_subs = 0;
+        gpu_time_busy = gpu_time_gap = gpu_time_max_gap = gpu_time_wait_gap = 0;
+        gpu_time_wait_subs = gpu_time_long_gaps = 0;
+    }
+}
 
 Scheduler::Scheduler(const Instance& instance, bool record_thread)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
@@ -28,6 +96,15 @@ Scheduler::Scheduler(const Instance& instance, bool record_thread)
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
+    if (const char* env = std::getenv("SOTC_GPU_TIME"); env && *env == '1') {
+        auto [result, pool] = instance.GetDevice().createQueryPoolUnique({
+            .queryType = vk::QueryType::eTimestamp,
+            .queryCount = GpuTimePairs * 2,
+        });
+        ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create the timestamp pool: {}",
+                   vk::to_string(result));
+        gpu_time_pool = std::move(pool);
+    }
     BeginSession();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
@@ -347,6 +424,10 @@ void Scheduler::BeginSession() {
         Check(session.primary.begin(begin_info));
     }
 
+    if (sessions.size() == 1) {
+        GpuTimeBegin();
+    }
+
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
 
@@ -443,6 +524,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
                                     static_cast<u32>(signal_value));
     }
 
+    GpuTimeEnd(signal_value, info.num_wait_semas);
     EndSession();
 
     boost::container::small_vector<vk::CommandBuffer, 8> cmd_buffers;

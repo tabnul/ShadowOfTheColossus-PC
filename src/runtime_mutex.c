@@ -85,11 +85,49 @@ static int32_t ensure_mutex(GuestMutex **mutex) {
     pthread_mutex_unlock(&static_init);
     return e;
 }
+/* sotc: SOTC_MUTEX_STATS=1: contended waits per (mutex, waiter site, owner site), dumped every 5 s. */
+typedef struct { void *m, *wsite, *osite; uint64_t ns, n, max; } MutexStat;
+static MutexStat mstats[256];
+static pthread_mutex_t mstats_lock = PTHREAD_MUTEX_INITIALIZER;
+static int mstats_on = -1;
+static uint64_t mono_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec; }
+static int mstat_cmp(const void *a, const void *b) { uint64_t x = ((const MutexStat *)a)->ns, y = ((const MutexStat *)b)->ns; return x < y ? 1 : x > y ? -1 : 0; }
+static void mstat_add(void *m, void *wsite, void *osite, uint64_t ns) {
+    static uint64_t last;
+    pthread_mutex_lock(&mstats_lock);
+    unsigned h = (unsigned)(((uintptr_t)m >> 4) ^ ((uintptr_t)wsite >> 2) ^ ((uintptr_t)osite >> 3)) & 255;
+    for (int i = 0; i < 256; ++i, h = (h + 1) & 255) {
+        MutexStat *s = &mstats[h];
+        if (!s->m) { s->m = m; s->wsite = wsite; s->osite = osite; }
+        if (s->m == m && s->wsite == wsite && s->osite == osite) { s->ns += ns; ++s->n; if (ns > s->max) s->max = ns; break; }
+    }
+    uint64_t now = mono_ns();
+    if (now - last > 5000000000u) {
+        last = now;
+        static MutexStat copy[256];
+        memcpy(copy, mstats, sizeof(copy));
+        memset(mstats, 0, sizeof(mstats));
+        qsort(copy, 256, sizeof(copy[0]), mstat_cmp);
+        for (int i = 0; i < 12 && copy[i].ns; ++i)
+            fprintf(stderr, "SOTCMTX %p w=%p o=%p ms=%.1f n=%llu max=%.2f\n", copy[i].m, copy[i].wsite, copy[i].osite,
+                    copy[i].ns / 1e6, (unsigned long long)copy[i].n, copy[i].max / 1e6);
+    }
+    pthread_mutex_unlock(&mstats_lock);
+}
 static ABI int32_t mutex_lock(GuestMutex **mutex) {
     int32_t e = ensure_mutex(mutex);
     if (e) return e;
     GuestMutex *m = *mutex;
     int native = pthread_mutex_trylock(&m->native);
+    if (native == EBUSY) {
+        if (mstats_on < 0) mstats_on = getenv("SOTC_MUTEX_STATS") != NULL;
+        if (mstats_on) {
+            void *osite = m->site;
+            uint64_t t0 = mono_ns();
+            native = pthread_mutex_lock(&m->native);
+            mstat_add(m, __builtin_return_address(0), osite, mono_ns() - t0);
+        }
+    }
     for (int waited = 0; native == EBUSY;) {
         struct timespec slice;
         clock_gettime(CLOCK_REALTIME, &slice);
@@ -151,8 +189,22 @@ static ABI int32_t mutex_timedlock(GuestMutex **mutex, uint32_t usec) {
     if (e) return e;
     struct timespec end;
     if (deadline_after(&end, usec)) return orbis_error(EINVAL);
-    e = timed_error(pthread_mutex_timedlock(&(*mutex)->native, &end));
-    if (!e) ++locks;
+    if (mstats_on < 0) mstats_on = getenv("SOTC_MUTEX_STATS") != NULL;
+    GuestMutex *m = *mutex;
+    void *osite = m->site;
+    uint64_t t0 = mstats_on ? mono_ns() : 0;
+    int native = pthread_mutex_trylock(&m->native);
+    if (native == EBUSY) native = pthread_mutex_timedlock(&m->native, &end);
+    if (mstats_on && t0) {
+        uint64_t dt = mono_ns() - t0;
+        if (dt > 2000) mstat_add(m, native ? (void *)1 : __builtin_return_address(0), osite, dt);
+        if (usec < 1000000 && dt > 2000) {
+            static _Atomic unsigned shown;
+            if (shown++ < 4) fprintf(stderr, "SOTCMTX timedlock usec=%u\n", usec);
+        }
+    }
+    e = timed_error(native);
+    if (!e) { ++locks; m->owner = current_tid(); m->site = __builtin_return_address(0); ++m->depth; }
     return e;
 }
 /* Condition variables: opaque handles over host pthread_cond (CLOCK_REALTIME,
