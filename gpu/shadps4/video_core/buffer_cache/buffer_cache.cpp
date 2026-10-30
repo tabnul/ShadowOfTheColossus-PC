@@ -254,14 +254,31 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         return;
     }
     // The guest thread waits for the GPU, not the command processor.
-    AsyncReadback readback{.device_addr = device_addr, .size = size, .is_write = is_write};
-    liverpool->SendCommand<true>([this, &readback] { BeginAsyncReadback(readback); });
-    if (!readback.waiting) {
-        return;
+    // sotc: SOTC_RB_REQUEUE=0 re-reads a dirtied window synchronously at finish (submit and
+    // drain on the command processor, the old behavior). On (default), the finish hands the
+    // dirtied window back to this thread, which begins a fresh readback of it: another GPU
+    // round trip for the guest, no drain for the frame. Two retries, then the sync path.
+    static const int max_requeues = [] {
+        const char* v = std::getenv("SOTC_RB_REQUEUE");
+        return !v || v[0] != '0' ? 2 : 0;
+    }();
+    for (int tries = 0;; ++tries) {
+        AsyncReadback readback{.device_addr = device_addr, .size = size, .is_write = is_write};
+        liverpool->SendCommand<true>([this, &readback] { BeginAsyncReadback(readback); });
+        if (!readback.waiting) {
+            return;
+        }
+        scheduler.WaitSubmitted(readback.tick, false);
+        scheduler.GetWorkSemaphore()->Wait(readback.tick);
+        bool requeue = false;
+        const bool allow = tries < max_requeues;
+        liverpool->SendCommand<true>(
+            [this, &readback, &requeue, allow] { requeue = FinishAsyncReadback(readback, allow); });
+        if (!requeue) {
+            return;
+        }
+        SotcStats::rb_requeues.fetch_add(1, std::memory_order_relaxed);
     }
-    scheduler.WaitSubmitted(readback.tick, false);
-    scheduler.GetWorkSemaphore()->Wait(readback.tick);
-    liverpool->SendCommand<true>([this, &readback] { FinishAsyncReadback(readback); });
 }
 
 void BufferCache::MarkWrittenByGuest(VAddr addr, u64 size) {
@@ -359,22 +376,23 @@ BufferCache::AsyncReadback* BufferCache::FindInflightReadback(VAddr addr, u64 si
     return nullptr;
 }
 
-void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
+bool BufferCache::FinishAsyncReadback(AsyncReadback& readback, bool allow_requeue) {
     if (readback.dependent) {
         // Finish the readbacks this one waited for (owners still blocked keep them alive).
+        // Their owner cannot retry a readback finished on its behalf: no requeue here.
         while (AsyncReadback* other = FindInflightReadback(readback.device_addr, readback.size)) {
             FinishAsyncReadback(*other);
         }
         if (readback.is_write) {
             MarkWrittenByGuest(readback.device_addr, readback.size);
         }
-        return;
+        return false;
     }
     if (readback.finished) {
         if (readback.is_write) {
             MarkWrittenByGuest(readback.device_addr, readback.size);
         }
-        return;
+        return false;
     }
     readback.finished = true;
     std::erase(inflight_readbacks, &readback);
@@ -412,6 +430,11 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
         staging_pool.FreeDeferred(download);
         if (window_dirty) {
             SotcStats::readback_dirty_retries.fetch_add(1, std::memory_order_relaxed);
+            if (allow_requeue) {
+                // The window's ranges never left the GPU-modified set and its pages stay
+                // protected: the guest begins a fresh readback of it instead of a sync drain.
+                return true;
+            }
             DownloadMemory(readback.arena, readback.window_start, readback.window_size);
         }
     } else if (readback.dirty) {
@@ -432,6 +455,7 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
     if (readback.is_write) {
         MarkWrittenByGuest(readback.device_addr, readback.size);
     }
+    return false;
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
