@@ -299,75 +299,30 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         return;
     }
     // The guest thread waits for the GPU, not the command processor.
-    // sotc: SOTC_RB_LOG=<us>: readbacks slower than that, per phase (begin on the draw thread,
-    // the GPU, finish on the draw thread).
-    static const s64 log_us = [] {
-        const char* v = std::getenv("SOTC_RB_LOG");
-        return v ? std::atoll(v) : 0;
+    // sotc: SOTC_RB_REQUEUE=0 re-reads a dirtied window synchronously at finish (submit and
+    // drain on the command processor, the old behavior). On (default), the finish hands the
+    // dirtied window back to this thread, which begins a fresh readback of it: another GPU
+    // round trip for the guest, no drain for the frame. Two retries, then the sync path.
+    static const int max_requeues = [] {
+        const char* v = std::getenv("SOTC_RB_REQUEUE");
+        return !v || v[0] != '0' ? 2 : 0;
     }();
-    using Clock = std::chrono::steady_clock;
-    // sotc: a readback whose asked bytes the GPU wrote again while it was in flight is done
-    // again (asynchronously, up to twice) instead of read back on the command processor.
-    for (u32 retries_left = 2;; --retries_left) {
-        const auto t0 = Clock::now();
-        AsyncReadback readback{.device_addr = device_addr, .size = size, .is_write = is_write,
-                               .retries_left = retries_left,
-                               .read_seq = liverpool->GuestSubmitSeq()};
+    for (int tries = 0;; ++tries) {
+        AsyncReadback readback{.device_addr = device_addr, .size = size, .is_write = is_write};
         liverpool->SendCommand<true>([this, &readback] { BeginAsyncReadback(readback); });
         if (!readback.waiting) {
             return;
         }
-        const auto t1 = Clock::now();
-        const auto t1s = Clock::now();
-        WaitReadback(readback);
-        const auto t2 = Clock::now();
-        Clock::time_point finish_start{};
-        for (;;) {
-            liverpool->SendCommand<true>([this, &readback, &finish_start] {
-                finish_start = Clock::now();
-                FinishAsyncReadback(readback);
-            });
-            if (!readback.rewait) {
-                break;
-            }
-            readback.rewait = false;
-            WaitReadback(readback);
-        }
-        {
-            const auto ns = [](auto d) {
-                return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(d).count();
-            };
-            const auto t3 = Clock::now();
-            SotcStats::rb_begin_ns.fetch_add(ns(t1 - t0), std::memory_order_relaxed);
-            SotcStats::rb_gpu_ns.fetch_add(ns(t2 - t1), std::memory_order_relaxed);
-            SotcStats::rb_finish_ns.fetch_add(ns(t3 - t2), std::memory_order_relaxed);
-        }
-        if (log_us > 0) {
-            const auto us = [](auto d) {
-                return std::chrono::duration_cast<std::chrono::microseconds>(d).count();
-            };
-            const auto t3 = Clock::now();
-            if (us(t3 - t0) >= log_us) {
-                std::fprintf(stderr,
-                             "SOTCRB us=%lld begin=%lld gpu=%lld finish=%lld addr=%#llx size=%#llx "
-                             "window=%#llx dl=%#llx dep=%d write=%d dirty=%d queued=%lld left=%u sub=%lld dsite=%u dprog=%#llx past=%d fut=%d rc=%u oth=%d\n",
-                             (long long)us(t3 - t0), (long long)us(t1 - t0), (long long)us(t2 - t1),
-                             (long long)us(t3 - t2), (unsigned long long)device_addr,
-                             (unsigned long long)size, (unsigned long long)readback.window_size,
-                             (unsigned long long)readback.download_size, readback.dependent ? 1 : 0,
-                             is_write ? 1 : 0,
-                             readback.dirty ? (readback.dirty_ranges.Intersects(device_addr, size) ? 1 : 2) : 0,
-                             (long long)us(finish_start - t2), retries_left,
-                             (long long)us(t1s - t1), readback.dirty_site,
-                             (unsigned long long)readback.dirty_program, readback.dirty_past ? 1 : 0,
-                             readback.dirty_future ? 1 : 0, readback.recopies,
-                             readback.dirty_other ? 1 : 0);
-            }
-        }
-        if (!readback.retry) {
+        scheduler.WaitSubmitted(readback.tick, false);
+        scheduler.GetWorkSemaphore()->Wait(readback.tick);
+        bool requeue = false;
+        const bool allow = tries < max_requeues;
+        liverpool->SendCommand<true>(
+            [this, &readback, &requeue, allow] { requeue = FinishAsyncReadback(readback, allow); });
+        if (!requeue) {
             return;
         }
-        SotcStats::readback_retries.fetch_add(1, std::memory_order_relaxed);
+        SotcStats::rb_requeues.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -475,26 +430,10 @@ void BufferCache::MarkInflightReadbacksDirty(VAddr addr, u64 size, u32 site) {
     // which the guest may write) changed these bytes: asynchronous readbacks of them in flight
     // hold stale data (FinishAsyncReadback reads them back again).
     for (AsyncReadback* readback : inflight_readbacks) {
-        for (const auto& item : readback->pending) {
+        for (auto& item : readback->pending) {
             if (addr < item.addr + item.size && item.addr < addr + size) {
-                if (site == 3 && readback->recopies < recopy_max) {
-                    readback->needs_recopy = true; // copied again after the writing op
-                    recopy_pending = true;
-                } else {
-                    readback->dirty_other = true;
-                }
-                if (!readback->dirty) {
-                    readback->dirty_site = site;
-                    readback->dirty_program = SotcStats::current_program.load();
-                }
-                if (site == 3 && liverpool->ExecSubmitSeq() > readback->read_seq) {
-                    readback->dirty_future = true;
-                } else {
-                    readback->dirty_past = true;
-                }
+                item.dirty = true;
                 readback->dirty = true;
-                const VAddr lo = Common::AlignDown(addr, VAddr{4096});
-                readback->dirty_ranges.Add(lo, Common::AlignUp(addr + size, VAddr{4096}) - lo);
             }
         }
     }
@@ -568,31 +507,23 @@ BufferCache::AsyncReadback* BufferCache::FindInflightReadback(VAddr addr, u64 si
     return nullptr;
 }
 
-void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
+bool BufferCache::FinishAsyncReadback(AsyncReadback& readback, bool allow_requeue) {
     if (readback.dependent) {
         // Finish the readbacks this one waited for (owners still blocked keep them alive).
+        // Their owner cannot retry a readback finished on its behalf: no requeue here.
         while (AsyncReadback* other = FindInflightReadback(readback.device_addr, readback.size)) {
-            if (!ReadbackDone(*other)) {
-                readback.tick = other->tick; // copied again since: wait for that
-                readback.rewait = true;
-                return;
-            }
             FinishAsyncReadback(*other);
         }
         if (readback.is_write) {
             MarkWrittenByGuest(readback.device_addr, readback.size);
         }
-        return;
+        return false;
     }
     if (readback.finished) {
         if (readback.is_write) {
             MarkWrittenByGuest(readback.device_addr, readback.size);
         }
-        return;
-    }
-    if (!ReadbackDone(readback)) {
-        readback.rewait = true; // copied again after the guest thread's wait
-        return;
+        return false;
     }
     readback.finished = true;
     std::erase(inflight_readbacks, &readback);
@@ -603,65 +534,45 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
         .mapped = const_cast<u8*>(readback.download_mapped),
         .type = VideoCore::MemoryType::HostCached,
     };
-    // sotc: SOTC_RB_PARTIAL=0: a dirty readback reads its whole window back again, waiting for
-    // the GPU on the command processor (hitches of up to ~40 ms, other threads' finishes queued
-    // behind it), the old way.
-    static const bool partial = [] {
-        const char* v = std::getenv("SOTC_RB_PARTIAL");
-        return !v || std::atoi(v) != 0;
+    // sotc: SOTC_RB_PART=0 goes back to re-reading the whole window when any of it was
+    // re-written in flight. On: only the regions a GPU write actually landed on are stale.
+    // The clean ones are applied as usual; a stale hot bring-along is dropped (its ranges
+    // never left the GPU-modified set and its pages stay read-protected, so its own fault
+    // reads it back); the window is re-read only when it was hit itself.
+    static const bool partial_finish = [] {
+        const char* v = std::getenv("SOTC_RB_PART");
+        return !v || v[0] != '0';
     }();
-    const bool asked_dirty =
-        readback.dirty && readback.dirty_ranges.Intersects(readback.device_addr, readback.size);
-    if (readback.dirty && partial && (!asked_dirty || readback.retries_left > 0)) {
-        // Apply what did not change since the copies (mostly hot regions brought along). The
-        // changed pages stay as they are: GPU-modified (a later GPU write; the next read brings
-        // it) or already applied or dropped. When the asked bytes changed, ReadMemory reads them
-        // back again.
-        boost::container::small_vector<ReadbackItem, 16> clean;
-        for (const auto& item : readback.pending) {
-            RangeSet left;
-            left.Add(item.addr, item.size);
-            readback.dirty_ranges.ForEachInRange(item.addr, item.size,
-                                                 [&](VAddr a, VAddr b) { left.Subtract(a, b - a); });
-            left.ForEach([&](VAddr a, VAddr b) {
-                ReadbackItem part{item.arena, a, b - a, {}, {}};
-                for (const auto& copy : item.copies) {
-                    const VAddr start = item.arena->cpu_addr + copy.srcOffset;
-                    const VAddr lo = std::max(start, a);
-                    const VAddr hi = std::min(start + copy.size, b);
-                    if (lo < hi) {
-                        part.copies.push_back(vk::BufferCopy{
-                            .srcOffset = copy.srcOffset + (lo - start),
-                            .dstOffset = copy.dstOffset + (lo - start),
-                            .size = hi - lo,
-                        });
-                    }
-                }
-                for (const auto& [range_addr, range_size] : item.gpu_ranges) {
-                    const VAddr lo = std::max(range_addr, a);
-                    const VAddr hi = std::min(range_addr + range_size, b);
-                    if (lo < hi) {
-                        part.gpu_ranges.emplace_back(lo, hi - lo);
-                    }
-                }
-                if (!part.gpu_ranges.empty()) {
-                    clean.push_back(std::move(part));
-                }
-            });
-        }
+    if (readback.dirty && partial_finish) {
         download.buffer->Invalidate(download.offset, download.size);
+        boost::container::small_vector<ReadbackItem, 16> clean;
+        bool window_dirty = false;
+        for (auto& item : readback.pending) {
+            if (!item.dirty) {
+                clean.push_back(std::move(item));
+            } else if (!item.hot) {
+                window_dirty = true;
+            } else {
+                SotcStats::rb_dirty_hot_dropped.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         ApplyDownloads(clean, download.mapped, download.offset);
         SubtractDownloaded(clean);
         staging_pool.FreeDeferred(download);
-        SotcStats::readback_partial.fetch_add(1, std::memory_order_relaxed);
-        if (asked_dirty) {
-            readback.retry = true;
-            return;
+        if (window_dirty) {
+            SotcStats::readback_dirty_retries.fetch_add(1, std::memory_order_relaxed);
+            if (allow_requeue) {
+                // The window's ranges never left the GPU-modified set and its pages stay
+                // protected: the guest begins a fresh readback of it instead of a sync drain.
+                return true;
+            }
+            DownloadMemory(readback.arena, readback.window_start, readback.window_size);
         }
     } else if (readback.dirty) {
         // A GPU write recorded after the copies (or another readback applied first and the
         // guest may have written since): the data may be stale. The ranges never left the
         // GPU-modified set; read the window back the usual way.
+        SotcStats::readback_dirty_retries.fetch_add(1, std::memory_order_relaxed);
         staging_pool.FreeDeferred(download);
         DownloadMemory(readback.arena, readback.window_start, readback.window_size);
     } else {
@@ -675,6 +586,7 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
     if (readback.is_write) {
         MarkWrittenByGuest(readback.device_addr, readback.size);
     }
+    return false;
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
@@ -688,7 +600,21 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     }
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     // Was the data written by work already submitted, or by the command buffer being built?
-    const bool written_by_current = WrittenByCurrent(pending);
+    if (current_writes_tick != scheduler.CurrentTick()) {
+        current_writes.Clear();
+        current_writes_tick = scheduler.CurrentTick();
+    }
+    bool written_by_current = false;
+    bool written_hot = false;
+    bool written_window = false;
+    for (const auto& item : pending) {
+        for (const auto& copy : item.copies) {
+            if (current_writes.Intersects(item.arena->cpu_addr + copy.srcOffset, copy.size)) {
+                written_by_current = true;
+                (item.hot ? written_hot : written_window) = true;
+            }
+        }
+    }
     for (auto& item : pending) {
         for (auto& copy : item.copies) {
             copy.dstOffset += download.offset;
@@ -735,10 +661,16 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     } else {
         SotcStats::readback_finish.fetch_add(1, std::memory_order_relaxed);
         // Did the guest ask for bytes the command buffer being built writes, or only a neighbour
-        // in the window (or a hot region) did?
+        // in the window (or a hot region) did? The split names what keeps the ahead path idle.
         if (fault_size != 0 && written_by_current &&
             current_writes.Intersects(fault_addr, fault_size)) {
             SotcStats::readback_finish_asked.fetch_add(1, std::memory_order_relaxed);
+        } else if (!written_by_current) {
+            SotcStats::readback_finish_binds.fetch_add(1, std::memory_order_relaxed);
+        } else if (written_window) {
+            SotcStats::readback_finish_window.fetch_add(1, std::memory_order_relaxed);
+        } else if (written_hot) {
+            SotcStats::readback_finish_hot.fetch_add(1, std::memory_order_relaxed);
         }
         for (const auto& item : pending) {
             runtime.CopyBuffer(item.arena, download.buffer, item.copies);
