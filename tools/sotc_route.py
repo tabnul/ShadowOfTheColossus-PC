@@ -192,6 +192,17 @@ def drive(args, pad, log, launched, launcher):
     def starts(t):
         return t.count(GAME_START) if t else 0
 
+    def invalid(why):
+        # Keep the failed run's log too: the next launch overwrites last_run.log.
+        subprocess.run(['taskkill', '/F', '/IM', 'bb-probe.exe'], capture_output=True)
+        try:
+            keep = log.with_name(f'invalid-{time.strftime("%Y%m%d-%H%M%S")}.log')
+            shutil.copy2(log, keep)
+            print(f'INVALID: {why} (log {keep})')
+        except OSError:
+            print(f'INVALID: {why}')
+        return 1
+
     def hold(button, seconds, until):
         pad.write_text(button)
         t = wait(seconds, until)
@@ -200,8 +211,7 @@ def drive(args, pad, log, launched, launcher):
 
     t = wait(120, lambda t: 'pad opened' in t)
     if not t:
-        print('INVALID: the game did not start')
-        return 1
+        return invalid('the game did not start')
     # Opening cinematic ("hold X to skip"), title, menu (Continue is selected): hold and tap X
     # until the save starts loading.
     t = wait(8)
@@ -210,8 +220,7 @@ def drive(args, pad, log, launched, launcher):
         if t is not None and starts(t) < 1:
             t = wait(1.5, lambda t: starts(t) >= 1)
     if t is None or starts(t) < 1:
-        print('INVALID: the save did not load')
-        return 1
+        return invalid('the save did not load')
     # Gameplay begins at the second start; a cutscene before it is skipped with X held.
     t = wait(25, lambda t: starts(t) >= 2)
     while t is not None and starts(t) < 2 and time.monotonic() - start < 360:
@@ -219,8 +228,7 @@ def drive(args, pad, log, launched, launcher):
         if t is not None and starts(t) < 2:
             t = wait(2, lambda t: starts(t) >= 2)
     if t is None or starts(t) < 2:
-        print('INVALID: gameplay did not begin')
-        return 1
+        return invalid('gameplay did not begin')
     # On a fast boot the menu can pass before any hold() ran, leaving the launch-time 'cross'
     # (the +nointro trick) held forever - which would skip every cutscene from here on.
     pad.write_text('')
@@ -229,8 +237,7 @@ def drive(args, pad, log, launched, launcher):
         # The jump restarts the gameflow twice more and prints the position when it has landed.
         t = wait(240, lambda t: 'Player Position:' in t or AUTOMATION_FAIL in t)
         if t is None or (t and AUTOMATION_FAIL in t):
-            print('INVALID: the boss jump did not finish')
-            return 1
+            return invalid('the boss jump did not land')
         if not args.intro:
             # The encounter's intro cutscene is hold-X skippable; in gameplay the holds just hop.
             for _ in range(3):
@@ -238,8 +245,7 @@ def drive(args, pad, log, launched, launcher):
                     break
         t = wait(240, lambda t: AUTOMATION_DONE in t or AUTOMATION_FAIL in t)
         if t is None or AUTOMATION_DONE not in t:
-            print('INVALID: the boss jump did not finish')
-            return 1
+            return invalid('the boss jump did not finish')
         print(f'in boss {args.boss} encounter', flush=True)
     if args.play:
         # Hand the game over: no timer, no kill, the boss is yours until you close the window.
@@ -247,7 +253,15 @@ def drive(args, pad, log, launched, launcher):
         return 0
     if args.measure is not None:
         print(f'measuring {args.measure:g}s', flush=True)
-        wait(args.measure)
+        if args.kill:
+            # The aftermath reloads the gameflow once the collapse cinematic has played out:
+            # stop there (the boss is dead) instead of sitting out the clock.
+            t = wait(args.measure, lambda t: starts(t) >= 3)
+            if t is not None and starts(t) >= 3:
+                print('boss is down', flush=True)
+                wait(3)
+        else:
+            wait(args.measure)
         subprocess.run(['taskkill', '/F', '/IM', 'bb-probe.exe'], capture_output=True)
         launcher.wait(30)
         # The next launch overwrites last_run.log: keep this run's copy for spike_report.py.
